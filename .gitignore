@@ -1,0 +1,24 @@
+# Environments
+.env
+.venv/
+env/
+venv/
+*.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Database and Data
+data/*.sqlite3
+data/*.xlsx
+*.db
+*.sqlite3
+
+# OS specific
+.DS_Store
+
+# Logs
+*.log
