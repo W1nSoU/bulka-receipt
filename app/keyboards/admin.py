@@ -12,7 +12,8 @@ def admin_main_kb() -> InlineKeyboardMarkup:
     kb.button(text="🏬 Магазини", callback_data="admin:shops")
     kb.button(text="📊 Статистика", callback_data="admin:stats")
     kb.button(text="🎯 Переможці", callback_data="admin:winner")
-    kb.adjust(2)
+    kb.button(text="⬅️ На головну", callback_data="back_to_main")
+    kb.adjust(2, 2, 2, 1)
     return kb.as_markup()
 
 

@@ -1,24 +1,40 @@
-# Environments
-.env
-.venv/
-env/
+# Віртуальне середовище
 venv/
-*.env
+env/
+ENV/
+
+# Environment variables
+.env
+.env.local
+
+# Database
+*.db
+*.db-journal
+data/
+
+# Excel files
+*.xlsx
 
 # Python
 __pycache__/
-*.pyc
-*.pyo
-*.pyd
+*.py[cod]
+*$py.class
+*.so
+.Python
 
-# Database and Data
-data/*.sqlite3
-data/*.xlsx
-*.db
-*.sqlite3
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
 
-# OS specific
+# OS
 .DS_Store
+Thumbs.db
 
 # Logs
 *.log
+
+# Test files
+test_receipts/
+photo/

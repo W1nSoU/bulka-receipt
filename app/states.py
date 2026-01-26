@@ -12,6 +12,10 @@ class ReceiptState(StatesGroup):
     waiting_for_photo = State()
 
 
+class ProfileState(StatesGroup):
+    waiting_for_new_name = State()
+
+
 class AdminAddShopState(StatesGroup):
     waiting_for_name = State()
     waiting_for_address = State()

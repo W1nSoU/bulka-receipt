@@ -9,7 +9,7 @@ from .admin import (
     cancel_kb,
     back_cancel_kb,
 )
-from .user import user_main_kb, contact_request_keyboard
+from .user import user_main_kb, contact_request_keyboard, profile_kb, back_kb
 
 __all__ = [
     "admin_main_kb",
@@ -23,4 +23,6 @@ __all__ = [
     "back_cancel_kb",
     "user_main_kb",
     "contact_request_keyboard",
+    "profile_kb",
+    "back_kb",
 ]

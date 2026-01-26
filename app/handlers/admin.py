@@ -9,7 +9,7 @@ from aiogram import F, Router
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.filters import BaseFilter, Command
 from aiogram.fsm.context import FSMContext
-from aiogram.types import CallbackQuery, FSInputFile, Message
+from aiogram.types import CallbackQuery, FSInputFile, Message, InlineKeyboardMarkup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from app import promo_manager, runtime, shops_manager
@@ -66,45 +66,98 @@ async def _context() -> tuple[Database, Settings]:
     return runtime.get_db(), runtime.get_settings()
 
 
-async def _edit_or_answer(message: Message | None, text: str, reply_markup=None) -> None:
-    if message is None:
-        return
-    # Avoid Telegram \"message is not modified\" errors
-    if message.text == text:
+async def _send_admin_photo_message(message: Message, text: str, reply_markup=None, state: FSMContext = None, edit: bool = False):
+    """
+    Sends or edits a photo message with sakura.jpg.
+    - If edit=True (Buttons): Tries to edit the message caption.
+    - If edit=False (Text Input): Deletes user message, DELETES previous bot message, and sends NEW bot message.
+    """
+    photo_path = "photo/sakura.jpg"
+    photo = FSInputFile(photo_path)
+    
+    # 1. Handle Text Input (User sent a message) -> Delete & Send New
+    if state and not edit:
+        # Delete user's text input
         try:
-            await message.edit_reply_markup(reply_markup=reply_markup)
-            return
-        except TelegramBadRequest as e:
-            if "message is not modified" in str(e).lower():
-                return
-            # fall through to sending a new message
-    try:
-        await message.edit_text(text, reply_markup=reply_markup)
-    except TelegramBadRequest as e:
-        if "message is not modified" in str(e).lower():
-            return
-        await message.answer(text, reply_markup=reply_markup)
-    except Exception:
-        await message.answer(text, reply_markup=reply_markup)
+            await message.delete()
+        except Exception:
+            pass
+            
+        data = await state.get_data()
+        prev_bot_msg_id = data.get("bot_msg_id")
+        
+        # Delete previous bot message
+        if prev_bot_msg_id:
+            try:
+                await message.bot.delete_message(chat_id=message.chat.id, message_id=prev_bot_msg_id)
+            except Exception:
+                pass
+        
+        # Send NEW message
+        sent = await message.answer_photo(photo, caption=text, reply_markup=reply_markup)
+        await state.update_data(bot_msg_id=sent.message_id)
+        return sent
+
+    # 2. Handle Callback (Button click) -> Edit existing
+    if edit:
+        try:
+            await message.edit_caption(caption=text, reply_markup=reply_markup)
+            # Ensure bot_msg_id is up to date in state
+            if state:
+                await state.update_data(bot_msg_id=message.message_id)
+            return message
+        except Exception:
+            # Edit failed (e.g. message too old), fall back to delete & send
+            pass
+
+    # 3. Fallback (Start command, or edit failed) -> Delete previous (if known or context) & Send New
+    
+    # If we tried to edit and failed, try to delete that message first to avoid duplicates
+    if edit:
+        try:
+            await message.delete()
+        except Exception:
+            pass
+    
+    sent = await message.answer_photo(photo, caption=text, reply_markup=reply_markup)
+    if state:
+        await state.update_data(bot_msg_id=sent.message_id)
+    return sent
 
 
-async def _show_admin_main(message: Message) -> None:
+async def _show_admin_main(message: Message, state: FSMContext = None) -> None:
     db, _ = await _context()
     is_active = await promo_manager.is_promo_active(db)
     status = "🟢 Акція активна" if is_active else "🔴 Акція неактивна"
-    await _edit_or_answer(
+    await _send_admin_photo_message(
         message,
         f"Панель адміністратора.\n{status}\n\nОберіть дію:",
         reply_markup=admin_main_kb(),
+        edit=True,
+        state=state
     )
 
 
-async def _show_settings_menu(message: Message) -> None:
-    await _edit_or_answer(message, "⚙️ <b>Налаштування акції</b>\n\nОберіть параметр:", reply_markup=admin_settings_kb())
+async def _show_settings_menu(message: Message, state: FSMContext = None) -> None:
+    await _send_admin_photo_message(message, "⚙️ <b>Налаштування акції</b>\n\nОберіть параметр:", reply_markup=admin_settings_kb(), edit=True, state=state)
 
 
-async def _show_shops_menu(message: Message) -> None:
-    await _edit_or_answer(message, "🏬 <b>Магазини-партнери</b>\n\nОберіть дію:", reply_markup=admin_shops_kb())
+async def _show_shops_menu(message: Message, state: FSMContext = None) -> None:
+    await _send_admin_photo_message(message, "🏬 <b>Магазини-партнери</b>\n\nОберіть дію:", reply_markup=admin_shops_kb(), edit=True, state=state)
+
+
+async def _show_shops_selection(message: Message, state: FSMContext, edit: bool = False) -> None:
+    db, _ = await _context()
+    shops = await db.list_shops()
+    data = await state.get_data()
+    selected = data.get("selected_shops", [])
+    await _send_admin_photo_message(
+        message,
+        "Оберіть магазини для акції (🟢 - обрано, 🔴 - не обрано):",
+        reply_markup=_shops_wizard_kb(shops, selected).as_markup(),
+        edit=edit,
+        state=state
+    )
 
 
 async def _do_campaign_start(db: Database, settings: Settings) -> None:
@@ -120,13 +173,14 @@ async def _do_campaign_start(db: Database, settings: Settings) -> None:
 @router.message(Command("admin"))
 async def admin_entry(message: Message, state: FSMContext) -> None:
     await state.clear()
-    await message.answer("Панель адміністратора. Оберіть дію:", reply_markup=admin_main_kb())
+    await _send_admin_photo_message(message, "Панель адміністратора. Оберіть дію:", reply_markup=admin_main_kb(), state=state)
 
 
 @router.callback_query(F.data == "admin:main")
 async def admin_main(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
-    await _show_admin_main(callback.message)
+    # Pass state to ensure bot_msg_id is updated
+    await _show_admin_main(callback.message, state)
     await callback.answer()
 
 
@@ -134,10 +188,12 @@ async def admin_main(callback: CallbackQuery, state: FSMContext) -> None:
 
 async def _start_campaign_wizard(message: Message, state: FSMContext) -> None:
     await state.set_state(AdminStartCampaignStates.start_date)
-    await _edit_or_answer(
+    await _send_admin_photo_message(
         message,
         "Введіть дату початку акції у форматі дд.мм.рррр",
         reply_markup=cancel_kb("admin:start:cancel"),
+        edit=True,
+        state=state
     )
 
 
@@ -145,7 +201,7 @@ async def _start_campaign_wizard(message: Message, state: FSMContext) -> None:
 async def admin_start_cancel(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
     await callback.answer()
-    await _edit_or_answer(callback.message, "Запуск акції скасовано.", reply_markup=admin_main_kb())
+    await _show_admin_main(callback.message, state)
 
 
 def _parse_date(text: str) -> str | None:
@@ -185,14 +241,14 @@ def _shops_wizard_kb(shops: list[tuple[int, str]], selected: list[int]) -> Inlin
 @router.callback_query(F.data == "admin:settings")
 async def admin_settings(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
-    await _show_settings_menu(callback.message)
+    await _show_settings_menu(callback.message, state)
     await callback.answer()
 
 
 @router.callback_query(F.data == "admin:shops")
 async def admin_shops(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
-    await _show_shops_menu(callback.message)
+    await _show_shops_menu(callback.message, state)
     await callback.answer()
 
 
@@ -200,10 +256,12 @@ async def admin_shops(callback: CallbackQuery, state: FSMContext) -> None:
 async def admin_campaign_start(callback: CallbackQuery, state: FSMContext) -> None:
     db, _ = await _context()
     if await promo_manager.is_promo_active(db):
-        await _edit_or_answer(
+        await _send_admin_photo_message(
             callback.message,
             "Зараз вже активна акція. Спочатку зупиніть поточну акцію, щоб запустити нову.",
             reply_markup=admin_main_kb(),
+            edit=True,
+            state=state
         )
         await callback.answer()
         return
@@ -212,10 +270,10 @@ async def admin_campaign_start(callback: CallbackQuery, state: FSMContext) -> No
 
 
 @router.callback_query(F.data == "admin:campaign_stop")
-async def admin_campaign_stop(callback: CallbackQuery) -> None:
+async def admin_campaign_stop(callback: CallbackQuery, state: FSMContext) -> None:
     db, settings = await _context()
     await promo_manager.set_promo_active(db, False)
-    await _edit_or_answer(callback.message, "Акцію зупинено. Формуємо файл...", reply_markup=admin_main_kb())
+    await _send_admin_photo_message(callback.message, "Акцію зупинено. Формуємо файл...", reply_markup=admin_main_kb(), edit=True, state=state)
     if settings.excel_path.exists():
         doc = FSInputFile(settings.excel_path)
         failed: list[int] = []
@@ -229,28 +287,34 @@ async def admin_campaign_stop(callback: CallbackQuery) -> None:
                 log.warning("Failed to send document to admin_id=%s", admin_id)
                 failed.append(admin_id)
         if failed:
-            await _edit_or_answer(
+            await _send_admin_photo_message(
                 callback.message,
                 "Файл надіслано, але деяким адміністраторам не доставлено (chat not found).",
                 reply_markup=admin_main_kb(),
+                edit=True,
+                state=state
             )
         else:
-            await _edit_or_answer(
+            await _send_admin_photo_message(
                 callback.message,
                 "Акцію зупинено. Файл надіслано адміністраторам.",
                 reply_markup=admin_main_kb(),
+                edit=True,
+                state=state
             )
     else:
-        await _edit_or_answer(callback.message, "Файл відсутній.", reply_markup=admin_main_kb())
+        await _send_admin_photo_message(callback.message, "Файл відсутній.", reply_markup=admin_main_kb(), edit=True, state=state)
     await callback.answer()
 
 
 @router.callback_query(F.data == "admin:stats")
-async def admin_stats(callback: CallbackQuery) -> None:
-    await _edit_or_answer(
+async def admin_stats(callback: CallbackQuery, state: FSMContext) -> None:
+    await _send_admin_photo_message(
         callback.message,
         "Статистика. Оберіть, що саме ви хочете переглянути:",
         reply_markup=admin_stats_kb(),
+        edit=True,
+        state=state
     )
     await callback.answer()
 
@@ -258,11 +322,12 @@ async def admin_stats(callback: CallbackQuery) -> None:
 @router.callback_query(F.data == "admin:winner")
 async def admin_winner(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
-    await _edit_or_answer(
+    await _send_admin_photo_message(
         callback.message,
-        "🎯 <b>Вибір переможців</b>\n\n"
-        "Натисніть кнопку, щоб обрати переможців серед зареєстрованих чеків.",
+        "🎯 <b>Вибір переможців</b>\n\n" "Натисніть кнопку, щоб обрати переможців серед зареєстрованих чеків.",
         reply_markup=admin_winner_kb(),
+        edit=True,
+        state=state
     )
     await callback.answer()
 
@@ -272,20 +337,21 @@ async def admin_winner_by_receipt(callback: CallbackQuery, state: FSMContext) ->
     db, _ = await _context()
     total_checks = await db.count_checks()
     if total_checks == 0:
-        await _edit_or_answer(
+        await _send_admin_photo_message(
             callback.message,
-            "❌ <b>Немає жодного зареєстрованого чека</b>\n\n"
-            "Дочекайтесь, поки учасники зареєструють чеки.",
+            "❌ <b>Немає жодного зареєстрованого чека</b>\n\n" "Дочекайтесь, поки учасники зареєструють чеки.",
             reply_markup=admin_winner_kb(),
+            edit=True,
+            state=state
         )
         await callback.answer()
         return
     await state.set_state(AdminWinnerState.waiting_for_count)
-    await _edit_or_answer(
+    await _send_admin_photo_message(
         callback.message,
-        f"🎟 <b>Вибір переможців</b>\n\n"
-        f"Всього зареєстровано чеків: <b>{total_checks}</b>\n\n"
-        f"Введіть кількість переможців (від 1 до {min(total_checks, 100)}):",
+        f"🎟 <b>Вибір переможців</b>\n\n" f"Всього зареєстровано чеків: <b>{total_checks}</b>\n\n" f"Введіть кількість переможців (від 1 до {min(total_checks, 100)}):",
+        edit=True,
+        state=state
     )
     await callback.answer()
 
@@ -305,7 +371,6 @@ def _winner_reselect_kb() -> InlineKeyboardMarkup:
     kb.adjust(1)
     return kb.as_markup()
 
-
 def _winner_done_kb() -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     kb.button(text="⬅️ Повернутися в панель", callback_data="admin:main")
@@ -319,19 +384,19 @@ async def admin_winner_count(message: Message, state: FSMContext) -> None:
     try:
         count = int(message.text.strip())
     except ValueError:
-        await message.answer("❌ Введіть число.")
+        await _send_admin_photo_message(message, "❌ Введіть число.", state=state)
         return
     
     total_checks = await db.count_checks()
     if count < 1 or count > min(total_checks, 100):
-        await message.answer(f"❌ Введіть число від 1 до {min(total_checks, 100)}.")
+        await _send_admin_photo_message(message, f"❌ Введіть число від 1 до {min(total_checks, 100)}.", state=state)
         return
     
     # Вибираємо випадкових переможців
     winners = await db.random_receipts(count)
     if not winners:
         await state.clear()
-        await message.answer("❌ Не вдалося обрати переможців.", reply_markup=admin_winner_kb())
+        await _send_admin_photo_message(message, "❌ Не вдалося обрати переможців.", reply_markup=admin_winner_kb(), state=state)
         return
     
     # Зберігаємо переможців у state
@@ -358,10 +423,11 @@ async def admin_winner_count(message: Message, state: FSMContext) -> None:
     
     lines.append("\n<b>Завершити акцію?</b>")
     
-    await message.answer(
+    await _send_admin_photo_message(
+        message,
         "\n".join(lines),
-        parse_mode="HTML",
         reply_markup=_winner_confirm_kb(),
+        state=state
     )
 
 
@@ -376,10 +442,12 @@ async def admin_winner_finish_no(callback: CallbackQuery, state: FSMContext) -> 
         lines.append(f"{i}. {w['full_name']}, {w['phone']}, #{w['check_code']}, {w['amount']:.2f} грн")
     
     await state.clear()
-    await _edit_or_answer(
+    await _send_admin_photo_message(
         callback.message,
         "\n".join(lines),
         reply_markup=_winner_reselect_kb(),
+        edit=True,
+        state=state
     )
     await callback.answer()
 
@@ -412,12 +480,12 @@ async def admin_winner_finish_yes(callback: CallbackQuery, state: FSMContext) ->
     
     await state.clear()
     
-    await _edit_or_answer(
+    await _send_admin_photo_message(
         callback.message,
-        f"✅ <b>Акцію завершено!</b>\n\n"
-        f"{winners_text}\n\n"
-        f"📄 Файл звіту надіслано адміністраторам.",
+        f"✅ <b>Акцію завершено!</b>\n\n" f"{winners_text}\n\n" f"📄 Файл звіту надіслано адміністраторам.",
         reply_markup=_winner_done_kb(),
+        edit=True,
+        state=state
     )
     await callback.answer()
 
@@ -425,10 +493,12 @@ async def admin_winner_finish_yes(callback: CallbackQuery, state: FSMContext) ->
 @router.callback_query(F.data == "admin:settings:period")
 async def admin_settings_period(callback: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(AdminSetDatesState.waiting_for_start)
-    await _edit_or_answer(
+    await _send_admin_photo_message(
         callback.message,
         "📅 Введіть дату початку у форматі <b>ДД.ММ.РРРР</b>",
         reply_markup=cancel_kb("admin:settings"),
+        edit=True,
+        state=state
     )
     await callback.answer()
 
@@ -436,10 +506,12 @@ async def admin_settings_period(callback: CallbackQuery, state: FSMContext) -> N
 @router.callback_query(F.data == "admin:settings:min_amount")
 async def admin_settings_min(callback: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(AdminSetMinAmountState.waiting_for_amount)
-    await _edit_or_answer(
+    await _send_admin_photo_message(
         callback.message,
         "💰 Введіть мінімальну суму покупки (наприклад: 500)",
         reply_markup=cancel_kb("admin:settings"),
+        edit=True,
+        state=state
     )
     await callback.answer()
 
@@ -447,10 +519,12 @@ async def admin_settings_min(callback: CallbackQuery, state: FSMContext) -> None
 @router.callback_query(F.data == "admin:settings:time")
 async def admin_settings_time(callback: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(AdminSetTimeRangeState.waiting_for_start)
-    await _edit_or_answer(
+    await _send_admin_photo_message(
         callback.message,
         "⏰ Вкажіть час початку у форматі <b>ГГ:ХХ</b>",
         reply_markup=cancel_kb("admin:settings"),
+        edit=True,
+        state=state
     )
     await callback.answer()
 
@@ -458,10 +532,12 @@ async def admin_settings_time(callback: CallbackQuery, state: FSMContext) -> Non
 @router.callback_query(F.data == "admin:settings:search")
 async def admin_settings_search(callback: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(AdminSearchState.waiting_for_query)
-    await _edit_or_answer(
+    await _send_admin_photo_message(
         callback.message,
         "🔍 Введіть телефон, ПІБ або код чеку",
         reply_markup=cancel_kb("admin:settings"),
+        edit=True,
+        state=state
     )
     await callback.answer()
 
@@ -472,14 +548,12 @@ async def admin_settings_channel(callback: CallbackQuery, state: FSMContext) -> 
     current = await promo_manager.get_telegram_channel(db)
     current_text = current if current else "не встановлено"
     await state.set_state(AdminSetChannelState.waiting_for_channel)
-    await _edit_or_answer(
+    await _send_admin_photo_message(
         callback.message,
-        f"📢 <b>Канал для підписки</b>\n\n"
-        f"Поточне значення: <code>{current_text}</code>\n\n"
-        "Введіть @username каналу (наприклад: @my_channel)\n"
-        "або напишіть <b>Вимкнути</b> щоб відключити.\n\n"
-        "⚠️ Бот повинен бути адміністратором каналу!",
+        f"📢 <b>Канал для підписки</b>\n\n" f"Поточне значення: <code>{current_text}</code>\n\n" "Введіть @username каналу (наприклад: @my_channel)\n" "або напишіть <b>Вимкнути</b> щоб відключити.\n\n" "⚠️ Бот повинен бути адміністратором каналу!",
         reply_markup=cancel_kb("admin:settings"),
+        edit=True,
+        state=state
     )
     await callback.answer()
 
@@ -491,11 +565,13 @@ async def set_channel(message: Message, state: FSMContext) -> None:
     
     if text.lower() in ["вимкнути", "off", "disable", "-"]:
         await promo_manager.set_telegram_channel(db, None)
-        await state.clear()
-        await message.answer(
+        await _send_admin_photo_message(
+            message,
             "✅ Перевірку підписки на канал вимкнено.",
             reply_markup=admin_settings_kb(),
+            state=state
         )
+        await state.clear()
         return
     
     # Валідація формату каналу
@@ -503,17 +579,17 @@ async def set_channel(message: Message, state: FSMContext) -> None:
         text = "@" + text
     
     await promo_manager.set_telegram_channel(db, text)
-    await state.clear()
-    await message.answer(
-        f"✅ Канал <code>{text}</code> встановлено.\n\n"
-        "Тепер користувачі мають бути підписані на канал для реєстрації чеків.",
-        parse_mode="HTML",
+    await _send_admin_photo_message(
+        message,
+        f"✅ Канал <code>{text}</code> встановлено.\n\n" "Тепер користувачі мають бути підписані на канал для реєстрації чеків.",
         reply_markup=admin_settings_kb(),
+        state=state
     )
+    await state.clear()
 
 
 @router.callback_query(F.data == "admin:stats:overview")
-async def admin_stats_overview(callback: CallbackQuery) -> None:
+async def admin_stats_overview(callback: CallbackQuery, state: FSMContext) -> None:
     db, _ = await _context()
     total, users_cnt, total_amount = await db.stats_overview()
     text = (
@@ -522,12 +598,12 @@ async def admin_stats_overview(callback: CallbackQuery) -> None:
         f"• Унікальних учасників: {users_cnt}\n"
         f"• Загальна сума покупок: {total_amount:.2f} грн"
     )
-    await _edit_or_answer(callback.message, text, reply_markup=admin_stats_kb())
+    await _send_admin_photo_message(callback.message, text, reply_markup=admin_stats_kb(), edit=True, state=state)
     await callback.answer()
 
 
 @router.callback_query(F.data == "admin:stats:by_shop")
-async def admin_stats_by_shop(callback: CallbackQuery) -> None:
+async def admin_stats_by_shop(callback: CallbackQuery, state: FSMContext) -> None:
     db, _ = await _context()
     rows = await db.stats_by_shop()
     if not rows:
@@ -537,12 +613,12 @@ async def admin_stats_by_shop(callback: CallbackQuery) -> None:
         for shop, cnt, total_sum in rows:
             lines.append(f"• {shop} — {cnt} чеків, сума {total_sum:.2f} грн")
         text = "\n".join(lines)
-    await _edit_or_answer(callback.message, text, reply_markup=admin_stats_kb())
+    await _send_admin_photo_message(callback.message, text, reply_markup=admin_stats_kb(), edit=True, state=state)
     await callback.answer()
 
 
 @router.callback_query(F.data == "admin:stats:last_checks")
-async def admin_stats_last_checks(callback: CallbackQuery) -> None:
+async def admin_stats_last_checks(callback: CallbackQuery, state: FSMContext) -> None:
     db, _ = await _context()
     latest = await db.latest_checks()
     if not latest:
@@ -554,38 +630,42 @@ async def admin_stats_last_checks(callback: CallbackQuery) -> None:
                 f"#{rec.id} — {rec.shop or 'Невідомо'}, {rec.amount or 0} грн, {rec.date or ''}"
             )
         text = "\n".join(lines)
-    await _edit_or_answer(callback.message, text, reply_markup=admin_stats_kb())
+    await _send_admin_photo_message(callback.message, text, reply_markup=admin_stats_kb(), edit=True, state=state)
     await callback.answer()
 
 
 @router.callback_query(F.data == "admin:shops:add")
 async def admin_shops_add(callback: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(AdminAddShopState.waiting_for_name)
-    await _edit_or_answer(
+    await _send_admin_photo_message(
         callback.message,
         "🏬 Введіть назву магазину",
         reply_markup=cancel_kb("admin:shops"),
+        edit=True,
+        state=state
     )
     await callback.answer()
 
 
 @router.callback_query(F.data == "admin:shops:delete")
-async def admin_shops_delete(callback: CallbackQuery) -> None:
+async def admin_shops_delete(callback: CallbackQuery, state: FSMContext) -> None:
     db, _ = await _context()
     shops = await db.list_shops()
     if not shops:
-        await _edit_or_answer(callback.message, "Список магазинів порожній", reply_markup=admin_shops_kb())
+        await _send_admin_photo_message(callback.message, "Список магазинів порожній", reply_markup=admin_shops_kb(), edit=True, state=state)
     else:
-        await _edit_or_answer(
+        await _send_admin_photo_message(
             callback.message,
             "Оберіть магазин для видалення:",
             reply_markup=shops_delete_kb(shops),
+            edit=True,
+            state=state
         )
     await callback.answer()
 
 
 @router.callback_query(F.data.startswith("admin:shops:delete_item:"))
-async def admin_shops_delete_item(callback: CallbackQuery) -> None:
+async def admin_shops_delete_item(callback: CallbackQuery, state: FSMContext) -> None:
     db, _ = await _context()
     shop_id_str = callback.data.split(":")[-1]
     try:
@@ -594,27 +674,29 @@ async def admin_shops_delete_item(callback: CallbackQuery) -> None:
         await callback.answer("Помилка id", show_alert=False)
         return
     await shops_manager.delete_shop(db, shop_id)
-    await _edit_or_answer(callback.message, "Магазин видалено", reply_markup=admin_shops_kb())
+    await _send_admin_photo_message(callback.message, "Магазин видалено", reply_markup=admin_shops_kb(), edit=True, state=state)
     await callback.answer("Готово")
 
 
 @router.callback_query(F.data == "admin:shops:toggle")
-async def admin_shops_toggle(callback: CallbackQuery) -> None:
+async def admin_shops_toggle(callback: CallbackQuery, state: FSMContext) -> None:
     db, _ = await _context()
     shops = await shops_manager.list_shops_with_flags(db)
     if not shops:
-        await _edit_or_answer(callback.message, "Немає магазинів для перемикання", reply_markup=admin_shops_kb())
+        await _send_admin_photo_message(callback.message, "Немає магазинів для перемикання", reply_markup=admin_shops_kb(), edit=True, state=state)
     else:
-        await _edit_or_answer(
+        await _send_admin_photo_message(
             callback.message,
             "Перемикайте участь магазинів:",
             reply_markup=shops_toggle_kb(shops),
+            edit=True,
+            state=state
         )
     await callback.answer()
 
 
 @router.callback_query(F.data.startswith("admin:shops:toggle_item:"))
-async def admin_shops_toggle_item(callback: CallbackQuery) -> None:
+async def admin_shops_toggle_item(callback: CallbackQuery, state: FSMContext) -> None:
     db, _ = await _context()
     shop_id_str = callback.data.split("admin:shops:toggle_item:")[-1]
     try:
@@ -630,19 +712,26 @@ async def admin_shops_toggle_item(callback: CallbackQuery) -> None:
         return
     new_state = await shops_manager.toggle_shop_for_campaign(db, shop_name)
     shops_with_flags = await shops_manager.list_shops_with_flags(db)
-    await callback.message.edit_reply_markup(reply_markup=shops_toggle_kb(shops_with_flags))
+    
+    await _send_admin_photo_message(
+        callback.message,
+        "Перемикайте участь магазинів:",
+        reply_markup=shops_toggle_kb(shops_with_flags),
+        edit=True,
+        state=state
+    )
     await callback.answer("Активовано" if new_state else "Вимкнено")
 
 
 @router.callback_query(F.data == "admin:shops:list")
-async def admin_shops_list(callback: CallbackQuery) -> None:
+async def admin_shops_list(callback: CallbackQuery, state: FSMContext) -> None:
     db, _ = await _context()
     shops = await shops_manager.list_shops_with_flags(db)
     if not shops:
-        await _edit_or_answer(callback.message, "Список магазинів порожній", reply_markup=admin_shops_kb())
+        await _send_admin_photo_message(callback.message, "Список магазинів порожній", reply_markup=admin_shops_kb(), edit=True, state=state)
     else:
         lines = [f"{name} — {'активний 🟢' if active else 'неактивний 🔴'}" for _, name, active in shops]
-        await _edit_or_answer(callback.message, "\n".join(lines), reply_markup=admin_shops_kb())
+        await _send_admin_photo_message(callback.message, "\n".join(lines), reply_markup=admin_shops_kb(), edit=True, state=state)
     await callback.answer()
 
 
@@ -653,26 +742,32 @@ async def admin_shops_list(callback: CallbackQuery) -> None:
 async def wizard_start_date(message: Message, state: FSMContext) -> None:
     iso = _parse_date(message.text)
     if not iso:
-        await message.answer(
+        await _send_admin_photo_message(
+            message,
             "Невірний формат дати. Введіть дату початку акції у форматі дд.мм.рррр",
             reply_markup=cancel_kb("admin:start:cancel"),
+            state=state
         )
         return
     await state.update_data(start_date=iso)
     await state.set_state(AdminStartCampaignStates.end_date)
-    await message.answer(
+    await _send_admin_photo_message(
+        message,
         "Введіть дату закінчення акції у форматі дд.мм.рррр",
         reply_markup=back_cancel_kb("admin:start:back:start", "admin:start:cancel"),
+        state=state
     )
 
 
 @router.callback_query(F.data == "admin:start:back:start")
 async def wizard_back_to_start_date(callback: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(AdminStartCampaignStates.start_date)
-    await _edit_or_answer(
+    await _send_admin_photo_message(
         callback.message,
         "Введіть дату початку акції у форматі дд.мм.рррр",
         reply_markup=cancel_kb("admin:start:cancel"),
+        edit=True,
+        state=state
     )
     await callback.answer()
 
@@ -681,34 +776,42 @@ async def wizard_back_to_start_date(callback: CallbackQuery, state: FSMContext) 
 async def wizard_end_date(message: Message, state: FSMContext) -> None:
     iso = _parse_date(message.text)
     if not iso:
-        await message.answer(
+        await _send_admin_photo_message(
+            message,
             "Невірний формат дати. Введіть дату закінчення у форматі дд.мм.рррр",
             reply_markup=back_cancel_kb("admin:start:back:start", "admin:start:cancel"),
+            state=state
         )
         return
     data = await state.get_data()
     start_date = data.get("start_date")
     if start_date and iso < start_date:
-        await message.answer(
+        await _send_admin_photo_message(
+            message,
             "Дата завершення не може бути раніше дати початку. Введіть коректну дату.",
             reply_markup=back_cancel_kb("admin:start:back:start", "admin:start:cancel"),
+            state=state
         )
         return
     await state.update_data(end_date=iso)
     await state.set_state(AdminStartCampaignStates.start_time)
-    await message.answer(
+    await _send_admin_photo_message(
+        message,
         "Введіть час початку акції у форматі год:хв (наприклад, 10:00)",
         reply_markup=back_cancel_kb("admin:start:back:end_date", "admin:start:cancel"),
+        state=state
     )
 
 
 @router.callback_query(F.data == "admin:start:back:end_date")
 async def wizard_back_to_end_date(callback: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(AdminStartCampaignStates.end_date)
-    await _edit_or_answer(
+    await _send_admin_photo_message(
         callback.message,
         "Введіть дату закінчення акції у форматі дд.мм.рррр",
         reply_markup=back_cancel_kb("admin:start:back:start", "admin:start:cancel"),
+        edit=True,
+        state=state
     )
     await callback.answer()
 
@@ -717,26 +820,32 @@ async def wizard_back_to_end_date(callback: CallbackQuery, state: FSMContext) ->
 async def wizard_start_time(message: Message, state: FSMContext) -> None:
     time_val = _parse_time(message.text)
     if not time_val:
-        await message.answer(
+        await _send_admin_photo_message(
+            message,
             "Невірний формат часу. Використовуйте год:хв (наприклад, 10:00)",
             reply_markup=back_cancel_kb("admin:start:back:end_date", "admin:start:cancel"),
+            state=state
         )
         return
     await state.update_data(start_time=time_val)
     await state.set_state(AdminStartCampaignStates.end_time)
-    await message.answer(
+    await _send_admin_photo_message(
+        message,
         "Введіть час закінчення акції у форматі год:хв (наприклад, 21:00)",
         reply_markup=back_cancel_kb("admin:start:back:start_time", "admin:start:cancel"),
+        state=state
     )
 
 
 @router.callback_query(F.data == "admin:start:back:start_time")
 async def wizard_back_to_start_time(callback: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(AdminStartCampaignStates.start_time)
-    await _edit_or_answer(
+    await _send_admin_photo_message(
         callback.message,
         "Введіть час початку акції у форматі год:хв (наприклад, 10:00)",
         reply_markup=back_cancel_kb("admin:start:back:end_date", "admin:start:cancel"),
+        edit=True,
+        state=state
     )
     await callback.answer()
 
@@ -746,16 +855,20 @@ async def wizard_end_time(message: Message, state: FSMContext) -> None:
     time_val = _parse_time(message.text)
     data = await state.get_data()
     if not time_val:
-        await message.answer(
+        await _send_admin_photo_message(
+            message,
             "Невірний формат часу. Використовуйте год:хв (наприклад, 21:00)",
             reply_markup=back_cancel_kb("admin:start:back:start_time", "admin:start:cancel"),
+            state=state
         )
         return
     start_time = data.get("start_time")
     if start_time and _minutes(time_val) < _minutes(start_time):
-        await message.answer(
+        await _send_admin_photo_message(
+            message,
             "Час завершення не може бути раніше часу початку.",
             reply_markup=back_cancel_kb("admin:start:back:start_time", "admin:start:cancel"),
+            state=state
         )
         return
     await state.update_data(end_time=time_val)
@@ -763,259 +876,160 @@ async def wizard_end_time(message: Message, state: FSMContext) -> None:
     await _show_shops_selection(message, state)
 
 
-@router.callback_query(F.data == "admin:start:back:end_time")
-async def wizard_back_to_end_time(callback: CallbackQuery, state: FSMContext) -> None:
-    await state.set_state(AdminStartCampaignStates.end_time)
-    await _edit_or_answer(
-        callback.message,
-        "Введіть час закінчення акції у форматі год:хв (наприклад, 21:00)",
-        reply_markup=back_cancel_kb("admin:start:back:start_time", "admin:start:cancel"),
-    )
-    await callback.answer()
-
-
-@router.callback_query(F.data == "admin:stats:by_period")
-async def admin_stats_by_period(callback: CallbackQuery, state: FSMContext) -> None:
-    await state.set_state(AdminStatsByPeriodStates.start_date)
-    await _edit_or_answer(
-        callback.message,
-        "Введіть дату початку періоду у форматі дд.мм.рррр",
-        reply_markup=cancel_kb("admin:stats"),
-    )
-    await callback.answer()
-
-
-@router.callback_query(F.data == "admin:stats:back")
-async def admin_stats_back(callback: CallbackQuery, state: FSMContext) -> None:
-    await state.clear()
-    await _edit_or_answer(
-        callback.message,
-        "Статистика. Оберіть, що саме ви хочете переглянути:",
-        reply_markup=admin_stats_kb(),
-    )
-    await callback.answer()
-
-
-@router.callback_query(F.data == "admin:stats:cancel")
-async def admin_stats_cancel(callback: CallbackQuery, state: FSMContext) -> None:
-    await state.clear()
-    await _show_admin_main(callback.message)
-    await callback.answer()
-
-
-@router.message(AdminStatsByPeriodStates.start_date, F.text)
-async def stats_period_start(message: Message, state: FSMContext) -> None:
-    iso = _parse_date(message.text)
-    if not iso:
-        await _edit_or_answer(
-            message,
-            "Невірний формат дати. Введіть дату початку періоду у форматі дд.мм.рррр",
-            reply_markup=cancel_kb("admin:stats"),
-        )
-        return
-    await state.update_data(period_start=iso)
-    await state.set_state(AdminStatsByPeriodStates.end_date)
-    await _edit_or_answer(
-        message,
-        "Введіть дату закінчення періоду у форматі дд.мм.рррр",
-        reply_markup=back_cancel_kb("admin:stats:back_start", "admin:stats:cancel"),
-    )
-
-
-@router.callback_query(F.data == "admin:stats:back_start")
-async def stats_period_back_start(callback: CallbackQuery, state: FSMContext) -> None:
-    await state.set_state(AdminStatsByPeriodStates.start_date)
-    await _edit_or_answer(
-        callback.message,
-        "Введіть дату початку періоду у форматі дд.мм.рррр",
-        reply_markup=cancel_kb("admin:stats"),
-    )
-    await callback.answer()
-
-
-@router.message(AdminStatsByPeriodStates.end_date, F.text)
-async def stats_period_end(message: Message, state: FSMContext) -> None:
-    iso = _parse_date(message.text)
-    data = await state.get_data()
-    if not iso:
-        await _edit_or_answer(
-            message,
-            "Невірний формат дати. Введіть дату закінчення у форматі дд.мм.рррр",
-            reply_markup=back_cancel_kb("admin:stats:back_start", "admin:stats:cancel"),
-        )
-        return
-    start_date = data.get("period_start")
-    if start_date and iso < start_date:
-        await _edit_or_answer(
-            message,
-            "Дата завершення не може бути раніше дати початку.",
-            reply_markup=back_cancel_kb("admin:stats:back_start", "admin:stats:cancel"),
-        )
-        return
-    db, _ = await _context()
-    total, users_cnt, total_amount = await db.stats_by_period(start_date or iso, iso)
-    await state.clear()
-    text = (
-        f"Статистика за період {start_date} – {iso}:\n"
-        f"• Всього чеків: {total}\n"
-        f"• Унікальних учасників: {users_cnt}\n"
-        f"• Загальна сума покупок: {total_amount:.2f} грн"
-    )
-    await message.answer(text, reply_markup=admin_stats_kb())
-
-
-async def _show_shops_selection(message: Message, state: FSMContext) -> None:
-    db, _ = await _context()
-    shops = await db.list_shops()
-    if not shops:
-        await _edit_or_answer(
-            message,
-            "Немає магазинів для вибору. Додайте магазини через меню адміністратора.",
-            reply_markup=admin_main_kb(),
-        )
-        await state.clear()
-        return
-    data = await state.get_data()
-    selected = data.get("shops") or []
-    kb = _shops_wizard_kb(shops, selected)
-    await _edit_or_answer(
-        message,
-        "Оберіть магазини-партнери, які беруть участь у цій акції.\n"
-        "Якщо потрібного магазину немає у списку — спочатку додайте його через меню адміністратора.",
-        reply_markup=kb.as_markup(),
-    )
-
-
 @router.callback_query(F.data.startswith("admin:start:shop:"))
 async def wizard_toggle_shop(callback: CallbackQuery, state: FSMContext) -> None:
-    db, _ = await _context()
-    shops = await db.list_shops()
-    shop_id_str = callback.data.split(":")[-1]
-    try:
-        shop_id = int(shop_id_str)
-    except ValueError:
-        await callback.answer("Невірний магазин")
-        return
+    shop_id = int(callback.data.split(":")[-1])
     data = await state.get_data()
-    selected: list[int] = data.get("shops") or []
+    selected = data.get("selected_shops", [])
     if shop_id in selected:
-        selected = [s for s in selected if s != shop_id]
+        selected.remove(shop_id)
     else:
         selected.append(shop_id)
-    await state.update_data(shops=selected)
-    kb = _shops_wizard_kb(shops, selected)
-    try:
-        await callback.message.edit_reply_markup(reply_markup=kb.as_markup())
-    except Exception:
-        await callback.message.answer(
-            "Оберіть магазини-партнери, які беруть участь у цій акції.\n"
-            "Якщо потрібного магазину немає у списку — спочатку додайте його через меню адміністратора.",
-            reply_markup=kb.as_markup(),
-        )
+    await state.update_data(selected_shops=selected)
+    db, _ = await _context()
+    shops = await db.list_shops()
+    await _send_admin_photo_message(
+        callback.message,
+        "Оберіть магазини для акції (🟢 - обрано, 🔴 - не обрано):",
+        reply_markup=_shops_wizard_kb(shops, selected).as_markup(),
+        edit=True,
+        state=state
+    )
     await callback.answer()
 
 
 @router.callback_query(F.data == "admin:start:shops_next")
 async def wizard_shops_next(callback: CallbackQuery, state: FSMContext) -> None:
     data = await state.get_data()
-    selected: list[int] = data.get("shops") or []
+    selected = data.get("selected_shops", [])
     if not selected:
         await callback.answer("Оберіть хоча б один магазин", show_alert=True)
         return
-    await state.set_state(AdminStartCampaignStates.min_amount)
-    await _edit_or_answer(
-        callback.message,
-        "Введіть мінімальну суму покупки для участі (наприклад, 300)",
-        reply_markup=back_cancel_kb("admin:start:back:shops", "admin:start:cancel"),
-    )
     await callback.answer()
+    await state.set_state(AdminStartCampaignStates.min_amount)
+    await _send_admin_photo_message(
+        callback.message,
+        "💰 Введіть мінімальну суму чеку для участі в акції (наприклад: 500):",
+        reply_markup=back_cancel_kb("admin:start:back:shops", "admin:start:cancel"),
+        edit=True,
+        state=state
+    )
+
+
+@router.message(AdminStartCampaignStates.min_amount, F.text)
+async def wizard_min_amount(message: Message, state: FSMContext) -> None:
+    text = message.text.strip()
+    try:
+        amount = int(text)
+        if amount < 0:
+            raise ValueError()
+    except ValueError:
+        await _send_admin_photo_message(
+            message,
+            "❌ Введіть коректну суму (ціле число >= 0)",
+            reply_markup=back_cancel_kb("admin:start:back:shops", "admin:start:cancel"),
+            state=state
+        )
+        return
+    await state.update_data(min_amount=amount)
+    await _show_wizard_summary(message, state)
+
+
+async def _show_wizard_summary(message: Message, state: FSMContext, edit: bool = False) -> None:
+    db, _ = await _context()
+    data = await state.get_data()
+    selected = data.get("selected_shops", [])
+    shops = await db.list_shops()
+    shop_names = [name for sid, name in shops if sid in selected]
+    
+    summary = (
+        f"📋 <b>Підтвердіть запуск акції:</b>\n\n"
+        f"📅 Дати: {data.get('start_date')} — {data.get('end_date')}\n"
+        f"🕐 Час: {data.get('start_time')} — {data.get('end_time')}\n"
+        f"🏬 Магазини: {', '.join(shop_names)}\n"
+        f"💰 Мін. сума: {data.get('min_amount')} грн"
+    )
+    
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✅ Запустити акцію", callback_data="admin:start:confirm")
+    kb.button(text="⬅️ Назад", callback_data="admin:start:back:min_amount")
+    kb.button(text="❌ Скасувати", callback_data="admin:start:cancel")
+    kb.adjust(1)
+    
+    await _send_admin_photo_message(
+        message,
+        summary,
+        reply_markup=kb.as_markup(),
+        edit=edit,
+        state=state
+    )
 
 
 @router.callback_query(F.data == "admin:start:back:shops")
 async def wizard_back_to_shops(callback: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(AdminStartCampaignStates.shops)
+    await _show_shops_selection(callback.message, state, edit=True)
     await callback.answer()
-    await _show_shops_selection(callback.message, state)
 
 
-@router.message(AdminStartCampaignStates.min_amount, F.text)
-async def wizard_min_amount(message: Message, state: FSMContext) -> None:
-    try:
-        amount = float(message.text.replace(",", "."))
-    except ValueError:
-        await message.answer(
-            "Невірне число. Введіть мінімальну суму покупки (наприклад, 300)",
-            reply_markup=back_cancel_kb("admin:start:back:shops", "admin:start:cancel"),
-        )
-        return
-    if amount <= 0:
-        await message.answer(
-            "Сума має бути більшою за нуль.",
-            reply_markup=back_cancel_kb("admin:start:back:shops", "admin:start:cancel"),
-        )
-        return
-    await state.update_data(min_amount=amount)
-    await _finalize_start(message, state)
+@router.callback_query(F.data == "admin:start:back:min_amount")
+async def wizard_back_to_min_amount(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.set_state(AdminStartCampaignStates.min_amount)
+    await _send_admin_photo_message(
+        callback.message,
+        "💰 Введіть мінімальну суму чеку для участі в акції (наприклад: 500):",
+        reply_markup=back_cancel_kb("admin:start:back:shops", "admin:start:cancel"),
+        edit=True,
+        state=state
+    )
+    await callback.answer()
 
 
-async def _finalize_start(message: Message, state: FSMContext) -> None:
+@router.callback_query(F.data == "admin:start:confirm")
+async def wizard_confirm_start(callback: CallbackQuery, state: FSMContext) -> None:
     db, settings = await _context()
     data = await state.get_data()
-    start_date = data.get("start_date")
-    end_date = data.get("end_date")
-    start_time = data.get("start_time")
-    end_time = data.get("end_time")
-    selected_shops: list[int] = data.get("shops") or []
-    min_amount = data.get("min_amount")
-
-    if not all([start_date, end_date, start_time, end_time, selected_shops, min_amount]):
-        await message.answer("Не всі дані заповнені. Спробуйте ще раз.", reply_markup=admin_main_kb())
-        await state.clear()
-        return
-
-    # map selected ids to names
-    shops_all = await db.list_shops()
-    id_to_name = {sid: name for sid, name in shops_all}
-    active_shops = [id_to_name[s] for s in selected_shops if s in id_to_name]
-
-    await promo_manager.set_date_range(db, start_date, end_date)
-    await promo_manager.set_time_range(db, start_time, end_time)
-    await promo_manager.set_min_amount(db, float(min_amount))
-    await promo_manager.set_active_shops(db, active_shops)
-
+    
+    # Зберігаємо дати та час
+    await db.set_setting("start_date", data.get("start_date"))
+    await db.set_setting("end_date", data.get("end_date"))
+    await db.set_setting("allowed_time_from", data.get("start_time"))
+    await db.set_setting("allowed_time_to", data.get("end_time"))
+    
+    # Зберігаємо мінімальну суму
+    await db.set_setting("min_amount", data.get("min_amount"))
+    
+    # Оновлюємо магазини для акції
+    selected = data.get("selected_shops", [])
+    shops = await db.list_shops()
+    active_shop_names = [name for sid, name in shops if sid in selected]
+    await db.set_setting("active_shops", active_shop_names)
+    
+    # Запускаємо акцію
     await _do_campaign_start(db, settings)
-
     await state.clear()
-    await message.answer(
-        f"Акцію успішно запущено.\nПеріод: {start_date} – {end_date}, час: {start_time}–{end_time}, мін. сума: {min_amount} грн.",
+    
+    await _send_admin_photo_message(
+        callback.message,
+        "✅ Акцію успішно запущено!",
         reply_markup=admin_main_kb(),
+        edit=True,
+        state=state
     )
+    await callback.answer("Акцію запущено!")
 
 
-@router.message(AdminSetDatesState.waiting_for_start, F.text)
-async def set_dates_start(message: Message, state: FSMContext) -> None:
-    # Підтримка обох форматів: ДД.ММ.РРРР та YYYY-MM-DD
-    text = message.text.strip()
-    parsed = None
-    for fmt in ["%d.%m.%Y", "%Y-%m-%d"]:
-        try:
-            parsed = datetime.strptime(text, fmt).date()
-            break
-        except ValueError:
-            continue
-    if not parsed:
-        await message.answer(
-            "❌ Невірний формат дати. Використовуйте <b>ДД.ММ.РРРР</b>",
-            parse_mode="HTML",
-        )
-        return
-    await state.update_data(start_date=parsed.isoformat())
-    await state.set_state(AdminSetDatesState.waiting_for_end)
-    await message.answer(
-        "📅 Введіть дату завершення у форматі <b>ДД.ММ.РРРР</b>",
-        parse_mode="HTML",
-        reply_markup=cancel_kb("admin:settings"),
+@router.callback_query(F.data == "admin:start:back:end_time")
+async def wizard_back_to_end_time(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.set_state(AdminStartCampaignStates.end_time)
+    await _send_admin_photo_message(
+        callback.message,
+        "Введіть час закінчення акції у форматі год:хв (наприклад, 21:00)",
+        reply_markup=back_cancel_kb("admin:start:back:start_time", "admin:start:cancel"),
+        edit=True,
+        state=state
     )
+    await callback.answer()
 
 
 @router.message(AdminSetDatesState.waiting_for_end, F.text)
@@ -1032,14 +1046,16 @@ async def set_dates_end(message: Message, state: FSMContext) -> None:
         except ValueError:
             continue
     if not parsed:
-        await message.answer(
+        await _send_admin_photo_message(
+            message,
             "❌ Невірний формат дати. Використовуйте <b>ДД.ММ.РРРР</b>",
-            parse_mode="HTML",
+            reply_markup=cancel_kb("admin:settings"),
+            state=state
         )
         return
     await promo_manager.set_date_range(db, start_date, parsed.isoformat())
+    await _send_admin_photo_message(message, "✅ Дати акції оновлено", reply_markup=admin_settings_kb(), state=state)
     await state.clear()
-    await message.answer("✅ Дати акції оновлено", reply_markup=admin_settings_kb())
 
 
 @router.message(AdminSetMinAmountState.waiting_for_amount, F.text)
@@ -1048,11 +1064,11 @@ async def set_min_amount(message: Message, state: FSMContext) -> None:
     try:
         amount = float(message.text.replace(",", "."))
     except ValueError:
-        await message.answer("❌ Введіть число")
+        await _send_admin_photo_message(message, "❌ Введіть число", reply_markup=cancel_kb("admin:settings"), state=state)
         return
     await promo_manager.set_min_amount(db, amount)
+    await _send_admin_photo_message(message, "✅ Мінімальну суму оновлено", reply_markup=admin_settings_kb(), state=state)
     await state.clear()
-    await message.answer("✅ Мінімальну суму оновлено", reply_markup=admin_settings_kb())
 
 
 @router.message(AdminSetTimeRangeState.waiting_for_start, F.text)
@@ -1060,14 +1076,20 @@ async def set_time_start(message: Message, state: FSMContext) -> None:
     try:
         datetime.strptime(message.text.strip(), "%H:%M")
     except ValueError:
-        await message.answer("❌ Вкажіть час у форматі <b>ГГ:ХХ</b>", parse_mode="HTML")
+        await _send_admin_photo_message(
+            message,
+            "❌ Вкажіть час у форматі <b>ГГ:ХХ</b>",
+            reply_markup=cancel_kb("admin:settings"),
+            state=state
+        )
         return
     await state.update_data(time_start=message.text.strip())
     await state.set_state(AdminSetTimeRangeState.waiting_for_end)
-    await message.answer(
+    await _send_admin_photo_message(
+        message,
         "⏰ Вкажіть час завершення у форматі <b>ГГ:ХХ</b>",
-        parse_mode="HTML",
         reply_markup=cancel_kb("admin:settings"),
+        state=state
     )
 
 
@@ -1080,11 +1102,16 @@ async def set_time_end(message: Message, state: FSMContext) -> None:
     try:
         datetime.strptime(end_time, "%H:%M")
     except ValueError:
-        await message.answer("❌ Вкажіть час у форматі <b>ГГ:ХХ</b>", parse_mode="HTML")
+        await _send_admin_photo_message(
+            message,
+            "❌ Вкажіть час у форматі <b>ГГ:ХХ</b>",
+            reply_markup=cancel_kb("admin:settings"),
+            state=state
+        )
         return
     await promo_manager.set_time_range(db, start_time, end_time)
+    await _send_admin_photo_message(message, "✅ Часовий діапазон оновлено", reply_markup=admin_settings_kb(), state=state)
     await state.clear()
-    await message.answer("✅ Часовий діапазон оновлено", reply_markup=admin_settings_kb())
 
 
 @router.message(AdminAddShopState.waiting_for_name, F.text)
@@ -1094,23 +1121,22 @@ async def add_shop_name(message: Message, state: FSMContext) -> None:
 
     existing = [name.lower() for _, name in await db.list_shops()]
     if shop_name.lower() in existing:
-        await message.answer(
-            "❌ Такий магазин вже існує.\n"
-            "Введіть іншу назву.",
+        await _send_admin_photo_message(
+            message,
+            "❌ Такий магазин вже існує.\n" "Введіть іншу назву.",
             reply_markup=cancel_kb("admin:shops"),
+            state=state
         )
         return
 
     shop_id = await shops_manager.add_shop(db, shop_name)
     await state.update_data(shop_id=shop_id, shop_name=shop_name)
     await state.set_state(AdminAddShopState.waiting_for_address)
-    await message.answer(
-        f"✅ Магазин <b>{shop_name}</b> створено!\n\n"
-        "📍 Введіть адресу магазину:\n"
-        "<i>наприклад: м. Київ, вул. Хрещатик 22</i>\n\n"
-        "Або напишіть <b>Пропустити</b>",
-        parse_mode="HTML",
+    await _send_admin_photo_message(
+        message,
+        f"✅ Магазин <b>{shop_name}</b> створено!\n\n" "📍 Введіть адресу магазину:\n" "<i>наприклад: м. Київ, вул. Хрещатик 22</i>\n\n" "Або напишіть <b>Пропустити</b>",
         reply_markup=cancel_kb("admin:shops"),
+        state=state
     )
 
 
@@ -1121,24 +1147,25 @@ async def add_shop_address(message: Message, state: FSMContext) -> None:
     shop_id = data.get("shop_id")
     
     if not shop_id:
-        await message.answer("❌ Сталася помилка, повторіть додавання магазину")
+        await _send_admin_photo_message(message, "❌ Сталася помилка, повторіть додавання магазину", reply_markup=admin_shops_kb(), state=state)
         await state.clear()
         return
     
     address_text = message.text.strip()
     if address_text.lower() != "пропустити":
         await db.set_shop_address(int(shop_id), address_text)
-        await message.answer(
-            f"✅ Адресу збережено: <b>{address_text}</b>\n\n"
-            "📸 Надішліть 1–5 фото прикладів чеків\nабо напишіть <b>Готово</b>",
-            parse_mode="HTML",
+        await _send_admin_photo_message(
+            message,
+            f"✅ Адресу збережено: <b>{address_text}</b>\n\n" "📸 Надішліть 1–5 фото прикладів чеків\nабо напишіть <b>Готово</b>",
             reply_markup=cancel_kb("admin:shops"),
+            state=state
         )
     else:
-        await message.answer(
+        await _send_admin_photo_message(
+            message,
             "📸 Надішліть 1–5 фото прикладів чеків\nабо напишіть <b>Готово</b>",
-            parse_mode="HTML",
             reply_markup=cancel_kb("admin:shops"),
+            state=state
         )
     
     await state.set_state(AdminAddShopState.waiting_for_samples)
@@ -1150,16 +1177,16 @@ async def add_shop_sample(message: Message, state: FSMContext) -> None:
     data = await state.get_data()
     shop_id = data.get("shop_id")
     if not shop_id:
-        await message.answer("❌ Сталася помилка, повторіть додавання магазину")
+        await _send_admin_photo_message(message, "❌ Сталася помилка, повторіть додавання магазину", reply_markup=admin_shops_kb(), state=state)
         await state.clear()
         return
     file_id = message.photo[-1].file_id
     await shops_manager.add_sample(db, int(shop_id), file_id)
-    await message.answer(
-        "✅ Фото збережено!\n"
-        "Надішліть ще або напишіть <b>Готово</b>",
-        parse_mode="HTML",
+    await _send_admin_photo_message(
+        message,
+        "✅ Фото збережено!\n" "Надішліть ще або напишіть <b>Готово</b>",
         reply_markup=cancel_kb("admin:shops"),
+        state=state
     )
 
 
@@ -1167,12 +1194,13 @@ async def add_shop_sample(message: Message, state: FSMContext) -> None:
 async def add_shop_done(message: Message, state: FSMContext) -> None:
     data = await state.get_data()
     shop_name = data.get("shop_name", "Магазин")
-    await state.clear()
-    await message.answer(
+    await _send_admin_photo_message(
+        message,
         f"✅ <b>{shop_name}</b> успішно додано!",
-        parse_mode="HTML",
         reply_markup=admin_shops_kb(),
+        state=state
     )
+    await state.clear()
 
 
 @router.message(AdminSearchState.waiting_for_query, F.text)
@@ -1180,22 +1208,19 @@ async def search_receipt(message: Message, state: FSMContext) -> None:
     db, _ = await _context()
     query = message.text.strip()
     receipt = await db.search_receipt(query)
-    await state.clear()
     if not receipt:
-        await message.answer("❌ Нічого не знайдено", reply_markup=admin_settings_kb())
+        await _send_admin_photo_message(message, "❌ Нічого не знайдено", reply_markup=admin_settings_kb(), state=state)
+        await state.clear()
         return
     user = await db.find_user(receipt.user_id)
-    await message.answer(
-        f"🧾 <b>Чек #{receipt.id}</b>\n\n"
-        f"👤 {user.full_name if user else '—'}\n"
-        f"📞 {user.phone if user else '—'}\n"
-        f"🏬 {receipt.shop or '—'}\n"
-        f"💰 {receipt.amount or 0} грн\n"
-        f"📅 {receipt.date or '—'} {receipt.time or ''}\n"
-        f"🔢 Код: {receipt.check_code or '—'}",
-        parse_mode="HTML",
+    
+    await _send_admin_photo_message(
+        message,
+        f"🧾 <b>Чек #{receipt.id}</b>\n\n" f"👤 {user.full_name if user else '—'}\n" f"📞 {user.phone if user else '—'}\n" f"🏬 {receipt.shop or '—'}\n" f"💰 {receipt.amount or 0} грн\n" f"📅 {receipt.date or '—'} {receipt.time or ''}\n" f"🔢 Код: {receipt.check_code or '—'}",
         reply_markup=admin_settings_kb(),
+        state=state
     )
+    await state.clear()
     try:
         await message.answer_photo(receipt.file_id)
     except Exception:

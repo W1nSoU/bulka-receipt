@@ -1,64 +1,68 @@
 from __future__ import annotations
-
 import os
-from dataclasses import dataclass
 from pathlib import Path
 from typing import List
 
 from dotenv import load_dotenv
 
-
 load_dotenv()
 
 
-def _parse_admin_ids(raw: str | None) -> List[int]:
-    if not raw:
-        return []
-    ids: List[int] = []
-    for part in raw.split(","):
-        part = part.strip()
-        if not part:
-            continue
-        try:
-            ids.append(int(part))
-        except ValueError:
-            continue
-    return ids
-
-
-@dataclass
 class Settings:
-    bot_token: str
-    gemini_api_key: str
-    gemini_model: str
-    admin_ids: List[int]
-    db_path: Path
-    excel_path: Path
-    data_dir: Path
+    def __init__(
+        self,
+        bot_token: str,
+        admin_ids: List[int],
+        db_path: Path,
+        excel_path: Path,
+        groq_api_keys: List[str],
+        groq_model: str,
+    ):
+        self.bot_token = bot_token
+        self.admin_ids = admin_ids
+        self.db_path = db_path
+        self.excel_path = excel_path
+        self.groq_api_keys = groq_api_keys
+        self.groq_model = groq_model
 
     @classmethod
-    def load(cls) -> "Settings":
-        bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
-        gemini_api_key = os.getenv("GEMINI_API_KEY")
-        if not bot_token:
-            raise RuntimeError("TELEGRAM_BOT_TOKEN is not set")
-        if not gemini_api_key:
-            raise RuntimeError("GEMINI_API_KEY is not set")
-        gemini_model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+    def load(cls) -> Settings:
+        token = os.getenv("BOT_TOKEN")
+        if not token:
+            raise RuntimeError("BOT_TOKEN is not set")
 
-        admin_ids = _parse_admin_ids(os.getenv("ADMIN_IDS"))
-        base_dir = Path(os.getenv("DATA_DIR", "data"))
-        base_dir.mkdir(parents=True, exist_ok=True)
+        admin_ids_str = os.getenv("ADMIN_IDS", "")
+        admin_ids = [int(x.strip()) for x in admin_ids_str.split(",") if x.strip()]
 
-        db_path = base_dir / "bot.sqlite3"
-        excel_path = base_dir / "promo.xlsx"
+        db_path = Path(os.getenv("DB_PATH", "data/bot.db"))
+        excel_path = Path(os.getenv("EXCEL_PATH", "data/checks.xlsx"))
+
+        # Groq API keys (підтримка множинних ключів)
+        groq_keys_str = os.getenv("GROQ_API_KEYS", "")
+        groq_api_keys = [k.strip() for k in groq_keys_str.split(",") if k.strip()]
+        
+        if not groq_api_keys:
+            raise RuntimeError("GROQ_API_KEYS not set in .env")
+
+        # ✅ ВИПРАВЛЕНО: правильна назва моделі за замовчуванням
+        groq_model = os.getenv(
+            "GROQ_MODEL", 
+            "meta-llama/llama-4-maverick-17b-128e-instruct"
+        )
 
         return cls(
-            bot_token=bot_token,
-            gemini_api_key=gemini_api_key,
-            gemini_model=gemini_model,
+            bot_token=token,
             admin_ids=admin_ids,
             db_path=db_path,
             excel_path=excel_path,
-            data_dir=base_dir,
+            groq_api_keys=groq_api_keys,
+            groq_model=groq_model,
+        )
+    
+    @property
+    def groq_fallback_model(self) -> str:
+        """Резервна модель якщо основна не працює"""
+        return os.getenv(
+            "GROQ_FALLBACK_MODEL", 
+            "meta-llama/llama-4-scout-17b-16e-instruct"
         )

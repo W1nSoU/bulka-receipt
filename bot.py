@@ -21,11 +21,39 @@ logging.getLogger("aiohttp").setLevel(logging.WARNING)
 log = logging.getLogger(__name__)
 
 
+def print_banner():
+    """Виводить красивий банер при старті."""
+    banner = """
+╔══════════════════════════════════════════════════════════════╗
+║                                                              ║
+║   🧾  BULKA RECEIPT — Бот для реєстрації чеків      🧾       ║
+║                    Promo System v1.0                         ║
+╚══════════════════════════════════════════════════════════════╝
+    """
+    print(banner)
+
+
+def print_status(emoji: str, message: str, indent: int = 5):
+    """Виводить статусне повідомлення з відступом."""
+    print(" " * indent + f"{emoji} {message}")
+
+
 async def main() -> None:
+    print_banner()
+    print_status("🚀", "Запуск бота...")
+    print()
+
+    print_status("⚙️", "Завантаження налаштувань...")
     settings = Settings.load()
+    
+    print_status("📦", "Ініціалізація бази даних...")
     db = Database(settings.db_path)
     await db.init()
+    print_status("✅", "База даних підключена", indent=7)
+    
     await promo_manager.ensure_defaults(db)
+    print_status("✅", "Налаштування акції перевірено", indent=7)
+    print()
 
     bot = Bot(token=settings.bot_token, default=DefaultBotProperties(parse_mode="HTML"))
     runtime.setup(db, settings)
@@ -36,8 +64,14 @@ async def main() -> None:
 
     dp.include_router(admin_router)
     dp.include_router(user_router)
+    print_status("🔌", "Роутери та обробники підключено")
 
-    log.info("Bot started")
+    print()
+    print("─" * 60)
+    print_status("🤖", "Бот готовий до роботи!", indent=3)
+    print("─" * 60)
+    print()
+
     await dp.start_polling(
         bot,
         allowed_updates=dp.resolve_used_update_types(),

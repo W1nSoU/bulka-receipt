@@ -135,6 +135,41 @@ class Database:
             created_at=now,
         )
 
+    async def update_user_name(self, telegram_id: int, new_name: str) -> None:
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute(
+                "UPDATE users SET full_name = ? WHERE telegram_id = ?",
+                (new_name, telegram_id),
+            )
+            await db.commit()
+
+    async def get_user_receipts(self, user_id: int, limit: int = 5) -> List[Receipt]:
+        rows = await self._fetchall(
+            """
+            SELECT * FROM checks 
+            WHERE user_id = ? 
+            ORDER BY created_at DESC 
+            LIMIT ?
+            """,
+            (user_id, limit),
+            row_factory=aiosqlite.Row,
+        )
+        return [
+            Receipt(
+                id=row["id"],
+                user_id=row["user_id"],
+                shop=row["shop"],
+                amount=row["amount"],
+                date=row["date"],
+                time=row["time"],
+                check_code=row["check_code"],
+                file_id=row["file_id"],
+                raw_text=row["raw_text"],
+                created_at=row["created_at"],
+            )
+            for row in rows
+        ]
+
     async def insert_check(
         self,
         user_id: int,
