@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import io
 import json
 import logging
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+import re
+from typing import Any, Dict, List, Optional, Tuple
 
 from groq import AsyncGroq
 from groq import (
@@ -16,6 +18,8 @@ from groq import (
     APITimeoutError,
     BadRequestError,
 )
+from PIL import Image, ImageEnhance, ImageOps
+import numpy as np
 
 from app.config import Settings
 
@@ -183,6 +187,81 @@ _rotator: Optional[CircularKeyRotator] = None
 _rotator_lock = asyncio.Lock()
 
 
+def _detect_mime_type(image_bytes: bytes) -> str:
+    """Визначає MIME тип зображення за сигнатурою байтів."""
+    if image_bytes[:2] == b'\xff\xd8':
+        return "image/jpeg"
+    if image_bytes[:8] == b'\x89PNG\r\n\x1a\n':
+        return "image/png"
+    if image_bytes[:4] in (b'RIFF', b'WEBP') or image_bytes[8:12] == b'WEBP':
+        return "image/webp"
+    return "image/jpeg"  # fallback
+
+
+def _check_blur(image_bytes: bytes, threshold: float = 500.0) -> Tuple[bool, float]:
+    """
+    Визначає чи зображення розмите (variance of image gradient).
+    Використовує різниці сусідніх пікселів як апроксимацію Лапласіана.
+
+    Returns:
+        (is_blurry, score) — score < threshold вважається розмитим.
+    """
+    try:
+        img = Image.open(io.BytesIO(image_bytes)).convert("L")  # grayscale
+        # Обмежуємо до 512px для швидкості
+        img.thumbnail((512, 512), Image.LANCZOS)
+        arr = np.array(img, dtype=np.float32)
+        # Variance of horizontal + vertical gradients (апроксимація Лапласіана)
+        dx = np.diff(arr, axis=1)
+        dy = np.diff(arr, axis=0)
+        score = float(np.var(dx) + np.var(dy))
+        is_blurry = score < threshold
+        return is_blurry, score
+    except Exception as e:
+        logger.warning(f"Blur check failed: {e}")
+        return False, 9999.0  # не блокуємо при помилці
+
+
+def _preprocess_image(image_bytes: bytes) -> Tuple[bytes, str]:
+    """
+    Препроцесинг зображення для кращого OCR:
+    - Конвертує в grayscale (кращий контраст тексту)
+    - Авто-контраст
+    - Підсилює різкість
+    - Обмежує максимальний розмір (2048px по довшій стороні)
+    - Повертає JPEG bytes та MIME тип
+    """
+    try:
+        img = Image.open(io.BytesIO(image_bytes))
+
+        # Обмежуємо розмір до 2048px по довшій стороні (зберігає пропорції)
+        max_side = 2048
+        if max(img.size) > max_side:
+            img = img.copy()
+            img.thumbnail((max_side, max_side), Image.LANCZOS)
+
+        # Grayscale — для чеків (чорний текст на білому) дає кращий OCR
+        img = img.convert("L")
+
+        # Авто-контраст — вирівнює засвіти/тіні без кліпінгу
+        img = ImageOps.autocontrast(img, cutoff=2)
+
+        # Підсилення різкості (+50%)
+        img = ImageEnhance.Sharpness(img).enhance(1.5)
+
+        # Конвертуємо назад в RGB (модель очікує RGB)
+        img = img.convert("RGB")
+
+        # Зберігаємо в JPEG
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=92, optimize=True)
+        return buf.getvalue(), "image/jpeg"
+
+    except Exception as e:
+        logger.warning(f"Image preprocessing failed, using original: {e}")
+        return image_bytes, _detect_mime_type(image_bytes)
+
+
 async def _get_rotator() -> CircularKeyRotator:
     """Отримує або створює глобальний ротатор (thread-safe)"""
     global _rotator
@@ -208,16 +287,10 @@ def _build_prompt(rules: Dict[str, Any]) -> str:
     
     shops_str = ", ".join(allowed_shops[:5]) if allowed_shops else "будь-який"
     
-    return f"""Ти система розпізнавання УКРАЇНСЬКИХ чеків. Витягни ВСІ поля з чека.
+    return f"""Ти — система розпізнавання УКРАЇНСЬКИХ фіскальних чеків (РРО/ПРРО/ФО-П). Витягни ВСІ поля.
 
-ВАЖЛИВО: Весь текст на чеках — ВИКЛЮЧНО УКРАЇНСЬКОЮ мовою. 
-Українська абетка має унікальні літери: Є, І, Ї, Ґ (не плутай з російськими Э, И, Ы, Г).
-
-УКРАЇНСЬКА ОРФОГРАФІЯ:
-- "Є" на початку слів: Єрмак, Євген, Євгенія, Єлизавета, Європа (НЕ "Ермак")
-- "і" замість російської "и": Наталія, Марія, Ірина, Віталій, Олексій
-- "ї" де потрібно: Олександрівна, Київ, їжа
-- Прізвища: Єрмак, Шевченко, Коваленко, Бондаренко
+ВАЖЛИВО: Текст на чеках — ВИКЛЮЧНО УКРАЇНСЬКОЮ мовою.
+Унікальні літери: Є, І, Ї, Ґ (не плутай з Э, И, Ы, Г).
 
 ФОРМАТ ВІДПОВІДІ (тільки JSON, без markdown):
 {{
@@ -235,51 +308,242 @@ def _build_prompt(rules: Dict[str, Any]) -> str:
 - Мінімальна сума: {min_amount} грн
 - Період: {start_date} — {end_date}
 
-ІНСТРУКЦІЇ:
-- Сума: використовуй КРАПКУ як роздільник (217.65)
-- Дата: конвертуй у формат YYYY-MM-DD
-- Час: 24-годинний формат HH:MM
-- Магазин: точна назва УКРАЇНСЬКОЮ (Є не Е, І не И)
-- Код чека: шукай ФН/ФП/ФІСКАЛЬНИЙ/CHECK #/НОМЕР ЧЕКА
-- Raw text: копіюй ВЕСЬ текст українською
-- Якщо поле нечитабельне → null
+ІНСТРУКЦІЇ ДЛЯ КОЖНОГО ПОЛЯ:
 
-ТИПОВІ МАГАЗИНИ:
-СІЛЬПО, SILPO, АТБ, ATB, НОВУС, NOVUS, БУЛКА, BULKA, ФОРА, FORA, АШАН, AUCHAN
+shop — назва мережі/магазину. Перевір верхній рядок чека.
+  Типові: СІЛЬПО, SILPO, АТБ, ATB, НОВУС, NOVUS, БУЛКА, BULKA, ФОРА, FORA, АШАН, AUCHAN, METRO, ВЕЛМАРТ.
+  Якщо є скорочена і повна назва — бери коротку (наприклад "БУЛКА", а не "ТОВ ПЕКАРНЯ БУЛКА").
+
+address — місто та вулиця. Зазвичай під назвою магазину.
+
+amount — ПІДСУМКОВА сума до сплати (не проміжні). Шукай: "СУМА", "ДО СПЛАТИ", "РАЗОМ", "ЗАГАЛЬНА СУМА", "TOTAL".
+  Використовуй КРАПКУ як роздільник (217.65). Ігноруй копійки-суфікси — якщо "21765" без роздільника, це 217.65.
+
+date — дата покупки. Конвертуй у YYYY-MM-DD.
+  Формати на чеках: DD.MM.YYYY, DD/MM/YYYY, YYYY-MM-DD.
+
+time — час покупки. 24-годинний формат HH:MM.
+
+check_code — фіскальний ідентифікатор. Шукай:
+  ФН, ФП, ФЧ, ФІСКАЛЬНИЙ НОМЕР, CHECK #, НОМЕР ЧЕКА, ЧЕК №, КВИТАНЦІЯ №.
+  На ПРРО-чеках: "Фіскальний номер документа", QR або штрих-код внизу (числовий рядок).
+  Якщо кілька номерів — бери той, що позначений "ФН" або "Фіскальний номер".
+
+raw_text — скопіюй ВЕСЬ видимий текст з чека рядок за рядком, зберігаючи українські літери.
+
+ТИПОВІ ПОМИЛКИ (уникай):
+- Не плутай суму ПДВ з підсумковою сумою.
+- Не плутай номер картки/телефону з кодом чека.
+- Якщо поле нечитабельне або відсутнє → null (не вигадуй).
 
 Відповідай ТІЛЬКИ JSON, без пояснень."""
+
+
+def _regex_extract_amount(text: str) -> Optional[float]:
+    """Витягує підсумкову суму з тексту чека regex-патернами."""
+    # Спочатку шукаємо "до сплати" / "разом" / "сума" — вони найнадійніші
+    priority_patterns = [
+        r"(?:до\s+сплати|сума\s+до\s+сплати|загальна\s+сума|разом\s+до\s+сплати)\s*[:\s]\s*(\d[\d\s]*[.,]\d{2})",
+        r"(?:разом|всього|total|підсумок)\s*[:\s]\s*(\d[\d\s]*[.,]\d{2})",
+        r"(?:сума|sum)\s*[:\s]\s*(\d[\d\s]*[.,]\d{2})",
+    ]
+    fallback_patterns = [
+        r"(\d{1,6}[.,]\d{2})\s*(?:грн|UAH|₴)",
+    ]
+    for pat in priority_patterns + fallback_patterns:
+        m = re.search(pat, text, re.IGNORECASE)
+        if m:
+            raw = m.group(1).replace(" ", "").replace(",", ".")
+            try:
+                return float(raw)
+            except ValueError:
+                continue
+    return None
+
+
+def _regex_extract_date(text: str) -> Optional[str]:
+    """Витягує дату покупки з тексту чека."""
+    patterns = [
+        r"\b(\d{2})[./](\d{2})[./](\d{4})\b",   # DD.MM.YYYY або DD/MM/YYYY
+        r"\b(\d{4})-(\d{2})-(\d{2})\b",           # YYYY-MM-DD
+        r"\b(\d{2})[./](\d{2})[./](\d{2})\b",     # DD.MM.YY
+    ]
+    for pat in patterns:
+        m = re.search(pat, text)
+        if m:
+            g = m.groups()
+            if len(g[2]) == 4 and g[2].startswith(("19", "20")):
+                # DD.MM.YYYY
+                return f"{g[2]}-{g[1].zfill(2)}-{g[0].zfill(2)}"
+            elif len(g[0]) == 4:
+                # YYYY-MM-DD
+                return f"{g[0]}-{g[1]}-{g[2]}"
+            else:
+                # DD.MM.YY → 20YY
+                return f"20{g[2]}-{g[1].zfill(2)}-{g[0].zfill(2)}"
+    return None
+
+
+def _regex_extract_time(text: str) -> Optional[str]:
+    """Витягує час покупки з тексту чека."""
+    m = re.search(r"\b(\d{2}):(\d{2})(?::\d{2})?\b", text)
+    if m:
+        h, mn = int(m.group(1)), int(m.group(2))
+        if 0 <= h <= 23 and 0 <= mn <= 59:
+            return f"{h:02d}:{mn:02d}"
+    return None
+
+
+def _regex_extract_check_code(text: str) -> Optional[str]:
+    """Витягує фіскальний код чека з тексту."""
+    patterns = [
+        r"(?:фіскальний\s+номер\s+документа|фіскальний\s+номер|фн|фп|фч)\s*[:\s#№]\s*(\d{6,20})",
+        r"(?:check\s*#|номер\s+чека|чек\s*№|квитанція\s*№)\s*[:\s]?\s*(\d{4,20})",
+        r"(?:фн|фп)\s+(\d{6,20})",
+        r"\bqr\b.*?(\d{10,20})",
+    ]
+    for pat in patterns:
+        m = re.search(pat, text, re.IGNORECASE)
+        if m:
+            return m.group(1)
+    return None
+
+
+def _apply_regex_fallback(result: ReceiptResult) -> ReceiptResult:
+    """
+    Якщо AI не зміг витягти критичні поля — пробуємо regex по raw_text.
+    Не перезаписує поля, які вже є.
+    """
+    if not result.raw_text:
+        return result
+
+    changed = []
+
+    if result.amount is None:
+        val = _regex_extract_amount(result.raw_text)
+        if val is not None:
+            result.amount = val
+            changed.append(f"amount={val}")
+
+    if result.date is None:
+        val = _regex_extract_date(result.raw_text)
+        if val is not None:
+            result.date = val
+            changed.append(f"date={val}")
+
+    if result.time is None:
+        val = _regex_extract_time(result.raw_text)
+        if val is not None:
+            result.time = val
+            changed.append(f"time={val}")
+
+    if result.check_code is None:
+        val = _regex_extract_check_code(result.raw_text)
+        if val is not None:
+            result.check_code = val
+            changed.append(f"check_code={val}")
+
+    if changed:
+        logger.info(f"🔍 Regex fallback recovered: {', '.join(changed)}")
+
+    return result
+
+
+async def _retry_missing_fields(
+    raw_text: str,
+    result: ReceiptResult,
+    rotator: "CircularKeyRotator",
+    model: str,
+) -> ReceiptResult:
+    """
+    Якщо після regex-fallback критичні поля ще null —
+    робимо короткий text-only запит до AI з raw_text.
+    """
+    missing = []
+    if result.amount is None:
+        missing.append("amount (сума до сплати, число з крапкою)")
+    if result.date is None:
+        missing.append('date (дата у форматі "YYYY-MM-DD")')
+
+    if not missing or not raw_text:
+        return result
+
+    fields_str = ", ".join(f'"{f.split()[0]}"' for f in missing)
+    prompt = (
+        f"З тексту чека нижче витягни ТІЛЬКИ ці поля: {', '.join(missing)}.\n"
+        f"Відповідай ТІЛЬКИ JSON: {{{', '.join(f'{f.split()[0]}: ...' for f in missing)}}}\n\n"
+        f"ТЕКСТ ЧЕКА:\n{raw_text[:1500]}"
+    )
+
+    async def make_text_request(client: AsyncGroq):
+        return await client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.0,
+            max_completion_tokens=256,
+            stream=False,
+        )
+
+    try:
+        response = await rotator.call_with_circular_retry(make_text_request)
+        content = response.choices[0].message.content or ""
+        content = content.strip().lstrip("```json").lstrip("```").rstrip("```").strip()
+        data = json.loads(content)
+
+        if result.amount is None and data.get("amount") is not None:
+            result.amount = float(data["amount"])
+            logger.info(f"🔁 AI retry recovered amount={result.amount}")
+        if result.date is None and data.get("date"):
+            result.date = str(data["date"])
+            logger.info(f"🔁 AI retry recovered date={result.date}")
+    except Exception as e:
+        logger.debug(f"AI retry for missing fields failed: {e}")
+
+    return result
 
 
 async def analyze_receipt(image_bytes: bytes, rules: Dict[str, Any]) -> ReceiptResult:
     """
     Аналізує чек через Groq Vision API з круговою ротацією ключів.
-    
+
     Args:
         image_bytes: Зображення чеку в форматі bytes
         rules: Правила поточної акції для валідації
-        
+
     Returns:
         ReceiptResult з розпізнаними даними
-        
+
     Raises:
-        ReceiptAnalysisError: Якщо всі API ключі не спрацювали
+        ReceiptAnalysisError: Якщо зображення розмите або всі API ключі не спрацювали
         ReceiptParseError: Якщо не вдалося розпарсити відповідь
     """
     rotator = await _get_rotator()
     settings = Settings.load()
-    
+
     logger.info(f"📸 Starting receipt analysis (image size: {len(image_bytes)} bytes)")
+
+    # Перевірка на розмитість — перед обробкою, щоб не витрачати API квоту
+    is_blurry, blur_score = _check_blur(image_bytes)
+    logger.info(f"🔍 Blur score: {blur_score:.1f} (blurry={is_blurry})")
+    if is_blurry:
+        raise ReceiptAnalysisError(
+            "Фото занадто розмите. Будь ласка, зробіть чіткіший знімок чека."
+        )
+    
+    # Препроцесинг: покращення якості та нормалізація формату
+    processed_bytes, mime_type = _preprocess_image(image_bytes)
+    logger.info(f"🖼️ Preprocessed: {len(processed_bytes)} bytes, MIME: {mime_type}")
     
     # Конвертуємо зображення в base64
-    image_base64 = base64.b64encode(image_bytes).decode('utf-8')
+    image_base64 = base64.b64encode(processed_bytes).decode('utf-8')
     
     # Промпт
     prompt = _build_prompt(rules)
     
     # Функція для виклику Groq API
-    async def make_groq_request(client: AsyncGroq):
+    async def make_groq_request(client: AsyncGroq, model: Optional[str] = None):
         response = await client.chat.completions.create(
-            model=settings.groq_model,
+            model=model or settings.groq_model,
             messages=[
                 {
                     "role": "user",
@@ -288,25 +552,39 @@ async def analyze_receipt(image_bytes: bytes, rules: Dict[str, Any]) -> ReceiptR
                         {
                             "type": "image_url",
                             "image_url": {
-                                "url": f"data:image/jpeg;base64,{image_base64}"
+                                "url": f"data:{mime_type};base64,{image_base64}"
                             }
                         }
                     ]
                 }
             ],
             temperature=0.0,
-            max_completion_tokens=2048,  # ✅ Правильний параметр
+            max_completion_tokens=2048,
             top_p=1,
             stream=False,
             stop=None,
         )
         return response
     
-    # Виклик з круговою ротацією
+    # Виклик з круговою ротацією основної моделі
+    response = None
     try:
         response = await rotator.call_with_circular_retry(make_groq_request)
     except ReceiptAnalysisError:
-        raise
+        # Основна модель не спрацювала — пробуємо fallback модель
+        fallback_model = settings.groq_fallback_model
+        if fallback_model and fallback_model != settings.groq_model:
+            logger.warning(
+                f"⚠️ Primary model failed. Retrying with fallback: {fallback_model}"
+            )
+            try:
+                async def make_fallback_request(client: AsyncGroq):
+                    return await make_groq_request(client, model=fallback_model)
+                response = await rotator.call_with_circular_retry(make_fallback_request)
+            except ReceiptAnalysisError:
+                raise
+        else:
+            raise
     except Exception as e:
         logger.exception("Unexpected error in Groq API call")
         raise ReceiptAnalysisError(
@@ -353,7 +631,16 @@ async def analyze_receipt(image_bytes: bytes, rules: Dict[str, Any]) -> ReceiptR
         errors=[],
         raw_text=data.get("raw_text", "")
     )
-    
+
+    # Regex fallback — відновлюємо поля, які AI не зміг витягти
+    result = _apply_regex_fallback(result)
+
+    # Smart AI retry — якщо критичні поля ще null, робимо text-only запит
+    if result.amount is None or result.date is None:
+        result = await _retry_missing_fields(
+            result.raw_text, result, rotator, settings.groq_model
+        )
+
     # Валідація проти правил акції
     result = _validate_against_rules(result, rules)
     

@@ -10,6 +10,7 @@ class RegistrationState(StatesGroup):
 
 class ReceiptState(StatesGroup):
     waiting_for_photo = State()
+    waiting_for_confirm = State()
 
 
 class ProfileState(StatesGroup):

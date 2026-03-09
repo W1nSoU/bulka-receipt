@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import logging
 from io import BytesIO
 
@@ -12,6 +14,8 @@ from app import promo_manager, runtime
 from app.ai import analyze_receipt, ReceiptAnalysisError, ReceiptParseError
 from app.excel import append_receipt, ensure_workbook
 from app.keyboards import contact_request_keyboard, user_main_kb, profile_kb, back_kb, admin_main_kb
+from app.keyboards.user import confirm_receipt_kb
+from app.rate_limiter import check_rate_limit, remaining
 from app.states import ReceiptState, RegistrationState, ProfileState
 
 
@@ -36,6 +40,24 @@ async def _send_photo_message(message: Message, text: str, reply_markup=None):
         parse_mode="HTML",
         reply_markup=reply_markup
     )
+
+
+async def _animate_processing(msg: Message, stop_event: asyncio.Event) -> None:
+    """Циклічно оновлює повідомлення під час обробки чека."""
+    frames = [
+        "📷 <b>Аналізую фото чека...</b>\n<i>Це займе кілька секунд</i>",
+        "🔍 <b>Розпізнаю текст...</b>\n<i>Читаю дані з чека</i>",
+        "🧮 <b>Перевіряю суму та дату...</b>\n<i>Порівнюю з умовами акції</i>",
+        "✨ <b>Майже готово...</b>\n<i>Завершую обробку</i>",
+    ]
+    idx = 0
+    while not stop_event.is_set():
+        try:
+            await msg.edit_text(frames[idx % len(frames)], parse_mode="HTML")
+        except Exception:
+            break
+        idx += 1
+        await asyncio.sleep(2.5)
 
 
 @router.message(CommandStart())
@@ -269,7 +291,8 @@ async def my_receipts(callback: CallbackQuery) -> None:
         return
 
     receipts = await db.get_user_receipts(user.id, limit=3)
-    
+    total_count, total_amount = await db.get_user_stats(user.id)
+
     if not receipts:
         await _send_photo_message(
             message,
@@ -280,17 +303,24 @@ async def my_receipts(callback: CallbackQuery) -> None:
         await callback.answer()
         return
 
-    msg_lines = ["🧾 <b>ВАШІ ОСТАННІ ЧЕКИ</b>\n\nТут відображаються 3 останні завантажені вами чеки:\n"]
+    msg_lines = [
+        "🧾 <b>МОЇ ЧЕКИ</b>\n",
+        f"📊 Всього: <b>{total_count}</b> чек(ів) | Сума: <b>{total_amount:.2f} грн</b>\n",
+    ]
     for i, r in enumerate(receipts, 1):
-        amount_str = f"{r.amount:.2f}" if r.amount else "0.00"
+        amount_str = f"{r.amount:.2f}" if r.amount else "—"
         date_str = r.date if r.date else "—"
         shop_name = r.shop if r.shop else "Невідомо"
         check_code = r.check_code if r.check_code else f"#{r.id}"
-        
-        msg_lines.append(f"{i}️⃣ <b>Магазин «{shop_name}»</b>")
-        msg_lines.append(f"   📅 {date_str} | 💰 {amount_str} грн")
-        msg_lines.append(f"   🆔 {check_code}\n")
-    
+
+        msg_lines.append(
+            f"┌─── Чек {i} ───────────\n"
+            f"│ 🏪 {shop_name}\n"
+            f"│ 💰 {amount_str} грн  📅 {date_str}\n"
+            f"│ 🆔 <code>{check_code}</code>\n"
+            f"└──────────────────────"
+        )
+
     await _send_photo_message(
         message,
         "\n".join(msg_lines),
@@ -434,30 +464,42 @@ async def handle_receipt_photo(message: Message, state: FSMContext) -> None:
     db, settings = await _get_db_bot_settings(message)
     user = await db.fetch_user(message.from_user.id)
     is_admin = message.from_user.id in settings.admin_ids
-    
+
     if not user:
         await state.clear()
-        await _send_photo_message(
-            message,
-            "❌ Спочатку зареєструйтесь за допомогою /start.",
-            back_kb()
-        )
+        await _send_photo_message(message, "❌ Спочатку зареєструйтесь за допомогою /start.", back_kb())
         return
+
     if not await promo_manager.is_promo_active(db):
         await state.clear()
         await _send_photo_message(
             message,
-            "🚫 Акція завершена. Нові чеки не приймаються.\n" 
+            "🚫 Акція завершена. Нові чеки не приймаються.\n"
             "Слідкуйте за оновленнями — нові акції вже скоро! 🎉",
             back_kb()
         )
         return
 
+    # Rate limiting
+    if not check_rate_limit(message.from_user.id):
+        left = remaining(message.from_user.id)
+        await _send_photo_message(
+            message,
+            "⏱ <b>Забагато спроб.</b>\n\n"
+            "Ви перевищили ліміт реєстрацій за сьогодні.\n"
+            "Спробуйте завтра або зверніться до підтримки.",
+            back_kb()
+        )
+        return
+
     waiting_msg = await message.answer(
-        "⏳ <b>Опрацьовую ваш чек...</b>\n" 
-        "Зачекайте, це займе кілька секунд.",
+        "📷 <b>Аналізую фото чека...</b>\n<i>Це займе кілька секунд</i>",
         parse_mode="HTML",
     )
+
+    # Анімація під час обробки
+    stop_event = asyncio.Event()
+    anim_task = asyncio.create_task(_animate_processing(waiting_msg, stop_event))
 
     photo = message.photo[-1]
     buffer = BytesIO()
@@ -465,52 +507,60 @@ async def handle_receipt_photo(message: Message, state: FSMContext) -> None:
     image_bytes = buffer.getvalue()
 
     rules = await promo_manager.rules_for_gemini(db)
+    result = None
+    exc = None
     try:
         result = await analyze_receipt(image_bytes, rules)
-    except (ReceiptAnalysisError, ReceiptParseError):
-        log.exception("Gemini processing failed")
+    except Exception as e:
+        exc = e
+    finally:
+        stop_event.set()
+        anim_task.cancel()
         try:
             await waiting_msg.delete()
-        except:
+        except Exception:
             pass
-        await _send_photo_message(
-            message,
-            "😔 <b>Не вдалося розпізнати чек.</b>\n\n" 
-            "Будь ласка, переконайтесь, що:\n" 
-            "• Фото чітке, а чек видно повністю та без засвітів\n" 
-            "• Чек гарно освітлений і текст не стертий\n" 
-            "• Дата покупки відповідає умовам акції\n\n" 
-            "Спробуйте надіслати краще фото. 📸",
-            back_kb()
-        )
-        return
-    except Exception:
-        log.exception("Gemini processing failed")
-        try:
-            await waiting_msg.delete()
-        except:
-            pass
-        await _send_photo_message(
-            message,
-            "⚠️ <b>Сталася невідома помилка.</b>\n" 
-            "Спробуйте, будь ласка, ще раз.",
-            back_kb()
-        )
-        return
 
-    try:
-        await waiting_msg.delete()
-    except Exception:
-        pass
+    if exc is not None:
+        if isinstance(exc, ReceiptAnalysisError):
+            log.warning("Receipt analysis error: %s", exc)
+            err_text = str(exc)
+            if "розмите" in err_text.lower():
+                user_msg = (
+                    "📷 <b>Фото занадто розмите.</b>\n\n"
+                    "Будь ласка, зробіть нову фотографію:\n"
+                    "• Тримайте телефон рівно над чеком\n"
+                    "• Переконайтесь, що текст у фокусі\n"
+                    "• Уникайте руху під час зйомки"
+                )
+            else:
+                user_msg = (
+                    "😔 <b>Не вдалося розпізнати чек.</b>\n\n"
+                    "Переконайтесь, що:\n"
+                    "• Фото чітке, чек видно повністю\n"
+                    "• Немає засвітів і тіней\n"
+                    "• Дата покупки відповідає умовам акції\n\n"
+                    "Спробуйте надіслати краще фото. 📸"
+                )
+        elif isinstance(exc, ReceiptParseError):
+            log.exception("Receipt parse error")
+            user_msg = (
+                "😔 <b>Не вдалося розпізнати чек.</b>\n\n"
+                "Переконайтесь, що:\n"
+                "• Фото чітке, чек видно повністю\n"
+                "• Немає засвітів і тіней\n"
+                "• Дата покупки відповідає умовам акції\n\n"
+                "Спробуйте надіслати краще фото. 📸"
+            )
+        else:
+            log.exception("Unexpected processing error")
+            user_msg = "⚠️ <b>Сталася невідома помилка.</b>\nСпробуйте, будь ласка, ще раз."
+        await _send_photo_message(message, user_msg, back_kb())
+        return
 
     log.info(
-        "Gemini parsed receipt: shop=%s amount=%s date=%s time=%s code=%s errors=%s",
-        result.shop,
-        result.amount,
-        result.date,
-        result.time,
-        result.check_code,
-        result.errors,
+        "Parsed receipt: shop=%s amount=%s date=%s code=%s errors=%s",
+        result.shop, result.amount, result.date, result.check_code, result.errors,
     )
 
     if not result.is_valid:
@@ -518,53 +568,123 @@ async def handle_receipt_photo(message: Message, state: FSMContext) -> None:
         log.warning("Receipt invalid: %s", reason)
         await _send_photo_message(
             message,
-            f"❌ <b>Чек не пройшов перевірку.</b>\n\n" 
-            f"Причина: {reason}.\n\n" 
-            "Будь ласка, перевірте умови акції та спробуйте ще раз. 🔄",
+            f"❌ <b>Чек не прийнято</b>\n\n"
+            f"<b>Причина:</b> {reason}\n\n"
+            "Перевірте умови акції та спробуйте ще раз. 🔄",
             back_kb()
         )
         return
 
-    if result.check_code and await db.is_duplicate_check_code(result.check_code):
-        log.warning("Duplicate check_code detected: %s", result.check_code)
+    # Хеш тексту для дубль-перевірки
+    raw_hash = hashlib.sha256(
+        result.raw_text.lower().replace(" ", "").encode()
+    ).hexdigest() if result.raw_text else None
+
+    # Дублікат по коду або по тексту
+    if (result.check_code and await db.is_duplicate_check_code(result.check_code)) or \
+       (raw_hash and await db.is_duplicate_raw_hash(raw_hash)):
+        log.warning("Duplicate receipt detected: code=%s hash=%s", result.check_code, raw_hash)
         await _send_photo_message(
             message,
-            "🧾 <b>Цей чек вже є в системі.</b>\n\n" 
-            "Пам'ятайте, кожен чек унікальний і реєструється лише раз.\n" 
-            "Надішліть інший, щоб продовжити.",
+            "🔁 <b>Цей чек вже зареєстровано.</b>\n\n"
+            "Кожен чек можна надіслати лише один раз.\n"
+            "Надішліть інший чек, щоб продовжити.",
             back_kb()
         )
+        return
+
+    # Зберігаємо в стані і просимо підтвердити
+    await state.set_state(ReceiptState.waiting_for_confirm)
+    await state.update_data(
+        pending_receipt={
+            "shop": result.shop,
+            "amount": result.amount,
+            "date": result.date,
+            "time": result.time,
+            "check_code": result.check_code,
+            "address": result.address,
+            "raw_text": result.raw_text,
+            "raw_hash": raw_hash,
+            "file_id": photo.file_id,
+        }
+    )
+
+    amount_str = f"{result.amount:.2f}" if result.amount else "—"
+    date_str = result.date or "—"
+    shop_str = result.shop or "—"
+
+    await _send_photo_message(
+        message,
+        "🔍 <b>Перевірте дані чека</b>\n\n"
+        "┌─────────────────────\n"
+        f"│ 🏪 <b>{shop_str}</b>\n"
+        f"│ 💰 <b>{amount_str} грн</b>\n"
+        f"│ 📅 {date_str}\n"
+        "└─────────────────────\n\n"
+        "Все правильно?",
+        confirm_receipt_kb()
+    )
+
+
+@router.callback_query(ReceiptState.waiting_for_confirm, F.data == "receipt:confirm")
+async def confirm_receipt(callback: CallbackQuery, state: FSMContext) -> None:
+    db, settings = await _get_db_bot_settings(callback.message)
+    user = await db.fetch_user(callback.from_user.id)
+    is_admin = callback.from_user.id in settings.admin_ids
+
+    data = await state.get_data()
+    pending = data.get("pending_receipt")
+    if not pending or not user:
+        await state.clear()
+        await callback.answer("Сесія застаріла, спробуйте ще раз.", show_alert=True)
         return
 
     receipt = await db.insert_check(
         user_id=user.id,
-        shop=result.shop,
-        amount=result.amount,
-        date=result.date,
-        time=result.time,
-        check_code=result.check_code,
-        file_id=photo.file_id,
-        raw_text=result.raw_text,
+        shop=pending.get("shop"),
+        amount=pending.get("amount"),
+        date=pending.get("date"),
+        time=pending.get("time"),
+        check_code=pending.get("check_code"),
+        file_id=pending["file_id"],
+        raw_text=pending.get("raw_text", ""),
+        raw_text_hash=pending.get("raw_hash"),
     )
 
     ensure_workbook(settings.excel_path)
-    append_receipt(settings.excel_path, receipt, user, message.from_user.username)
-
-    log.info("Receipt saved: id=%s user_id=%s shop=%s amount=%s", receipt.id, user.id, result.shop, result.amount)
+    append_receipt(settings.excel_path, receipt, user, callback.from_user.username)
+    log.info("Receipt saved: id=%s user_id=%s shop=%s amount=%s", receipt.id, user.id, pending.get("shop"), pending.get("amount"))
 
     await state.clear()
-    amount_str = f"{result.amount:.2f}" if result.amount else "0.00"
-    
+    amount_str = f"{pending['amount']:.2f}" if pending.get("amount") else "—"
+    date_str = pending.get("date") or "—"
+    shop_str = pending.get("shop") or "—"
+
     await _send_photo_message(
-        message,
-        "✅ <b>Чудово! Ваш чек зареєстровано.</b>\n\n" 
-        f"<b>Магазин:</b> {result.shop or '—'}\n" 
-        f"<b>Сума:</b> {amount_str} грн\n" 
-        f"<b>Дата:</b> {result.date or '—'}\n\n" 
-        f"Ваш номер для розіграшу: <b>#{receipt.id}</b>\n\n" 
-        "Бажаємо успіху! 🍀",
-        user_main_kb(is_admin=is_admin) 
+        callback.message,
+        "🎉 <b>Чек успішно зареєстровано!</b>\n\n"
+        "┌─────────────────────\n"
+        f"│ 🏪 <b>{shop_str}</b>\n"
+        f"│ 💰 <b>{amount_str} грн</b>\n"
+        f"│ 📅 {date_str}\n"
+        "└─────────────────────\n\n"
+        f"🎟 Ваш номер у розіграші: <b>#{receipt.id}</b>\n\n"
+        "Бажаємо удачі! 🍀",
+        user_main_kb(is_admin=is_admin)
     )
+    await callback.answer()
+
+
+@router.callback_query(ReceiptState.waiting_for_confirm, F.data == "receipt:retry")
+async def retry_receipt_photo(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.set_state(ReceiptState.waiting_for_photo)
+    await _send_photo_message(
+        callback.message,
+        "📸 <b>Надішліть нове фото чека</b>\n\n"
+        "<i>Переконайтесь, що текст чітко видно</i>",
+        back_kb()
+    )
+    await callback.answer()
 
 
 @router.message(ReceiptState.waiting_for_photo)

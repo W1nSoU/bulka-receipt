@@ -5,18 +5,22 @@ from aiogram.types import KeyboardButton, ReplyKeyboardMarkup, InlineKeyboardMar
 
 def user_main_kb(is_admin: bool = False) -> InlineKeyboardMarkup:
     buttons = [
-        [InlineKeyboardButton(text="📝 Зареєструвати чек", callback_data="register_receipt")],
-        [InlineKeyboardButton(text="🧾 Мої чеки", callback_data="my_receipts")],
-        [InlineKeyboardButton(text="👤 Мій профіль", callback_data="profile")],
-        [InlineKeyboardButton(text="📜 Правила акції", callback_data="rules")],
-        [InlineKeyboardButton(text="🆘 Підтримка", callback_data="support")],
+        # Головна дія — на весь рядок
+        [InlineKeyboardButton(text="📸 Зареєструвати чек", callback_data="register_receipt")],
+        # Другорядні дії — парами
+        [
+            InlineKeyboardButton(text="🧾 Мої чеки", callback_data="my_receipts"),
+            InlineKeyboardButton(text="👤 Профіль", callback_data="profile"),
+        ],
+        [
+            InlineKeyboardButton(text="📜 Правила", callback_data="rules"),
+            InlineKeyboardButton(text="🆘 Підтримка", callback_data="support"),
+        ],
     ]
     if is_admin:
         buttons.append([InlineKeyboardButton(text="🔐 Адмін панель", callback_data="admin_panel")])
-    
-    return InlineKeyboardMarkup(
-        inline_keyboard=buttons
-    )
+
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
 def contact_request_keyboard() -> ReplyKeyboardMarkup:
@@ -39,5 +43,17 @@ def back_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="⬅️ На головну", callback_data="back_to_main")]
+        ]
+    )
+
+
+def confirm_receipt_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✅ Зберегти", callback_data="receipt:confirm"),
+                InlineKeyboardButton(text="🔄 Нове фото", callback_data="receipt:retry"),
+            ],
+            [InlineKeyboardButton(text="❌ Скасувати", callback_data="back_to_main")],
         ]
     )

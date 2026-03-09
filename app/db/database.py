@@ -74,6 +74,7 @@ class Database:
                     check_code TEXT,
                     file_id TEXT NOT NULL,
                     raw_text TEXT,
+                    raw_text_hash TEXT,
                     created_at TEXT NOT NULL,
                     FOREIGN KEY(user_id) REFERENCES users(id)
                 );
@@ -100,6 +101,18 @@ class Database:
                 );
                 """
             )
+            # Міграція: додаємо raw_text_hash якщо колонки ще немає
+            try:
+                await db.execute("ALTER TABLE checks ADD COLUMN raw_text_hash TEXT")
+            except Exception:
+                pass  # колонка вже існує
+            # Індекс на raw_text_hash — після міграції, щоб колонка точно існувала
+            try:
+                await db.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_checks_raw_text_hash ON checks(raw_text_hash)"
+                )
+            except Exception:
+                pass
             await db.commit()
 
     async def fetch_user(self, telegram_id: int) -> Optional[User]:
@@ -180,15 +193,16 @@ class Database:
         check_code: Optional[str],
         file_id: str,
         raw_text: str,
+        raw_text_hash: Optional[str] = None,
     ) -> Receipt:
         now = datetime.utcnow().isoformat()
         async with aiosqlite.connect(self.path) as db:
             cursor = await db.execute(
                 """
-                INSERT INTO checks (user_id, shop, amount, date, time, check_code, file_id, raw_text, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO checks (user_id, shop, amount, date, time, check_code, file_id, raw_text, raw_text_hash, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (user_id, shop, amount, date, time, check_code, file_id, raw_text, now),
+                (user_id, shop, amount, date, time, check_code, file_id, raw_text, raw_text_hash, now),
             )
             await db.commit()
             check_id = cursor.lastrowid
@@ -212,6 +226,22 @@ class Database:
             "SELECT id FROM checks WHERE check_code = ? LIMIT 1", (check_code,)
         )
         return row is not None
+
+    async def is_duplicate_raw_hash(self, raw_text_hash: Optional[str]) -> bool:
+        if not raw_text_hash:
+            return False
+        row = await self._fetchone(
+            "SELECT id FROM checks WHERE raw_text_hash = ? LIMIT 1", (raw_text_hash,)
+        )
+        return row is not None
+
+    async def get_user_stats(self, user_id: int) -> tuple[int, float]:
+        """Повертає (кількість чеків, загальна сума) для юзера."""
+        row = await self._fetchone(
+            "SELECT COUNT(*), COALESCE(SUM(amount), 0.0) FROM checks WHERE user_id = ?",
+            (user_id,),
+        )
+        return (int(row[0]), float(row[1])) if row else (0, 0.0)
 
     async def set_setting(self, key: str, value: Any) -> None:
         stored = json.dumps(value) if not isinstance(value, str) else value

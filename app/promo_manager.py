@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from datetime import date
 from typing import Any, Dict, List, Optional
 
@@ -63,7 +64,17 @@ async def toggle_shop(db: Database, shop_name: str) -> bool:
     return True
 
 
+_rules_cache: Optional[Dict[str, Any]] = None
+_rules_cache_ts: float = 0.0
+_RULES_CACHE_TTL = 30.0  # секунди
+
+
 async def rules_for_gemini(db: Database) -> Dict[str, Any]:
+    global _rules_cache, _rules_cache_ts
+    now = time.monotonic()
+    if _rules_cache is not None and (now - _rules_cache_ts) < _RULES_CACHE_TTL:
+        return _rules_cache
+
     settings = DEFAULT_RULES | {}
     settings.update(await db.get_settings_map())
 
@@ -81,7 +92,7 @@ async def rules_for_gemini(db: Database) -> Dict[str, Any]:
         if address and name.upper() in [s.upper() for s in active_shops]:
             shop_addresses[name.upper()] = address
 
-    return {
+    result = {
         "campaign_active": str(settings.get("promo_active", "false")).lower() == "true",
         "start_date": start_date,
         "end_date": end_date,
@@ -96,6 +107,17 @@ async def rules_for_gemini(db: Database) -> Dict[str, Any]:
             if allowed_time_from and allowed_time_to
             else None,
     }
+
+    _rules_cache = result
+    _rules_cache_ts = now
+    return result
+
+
+def invalidate_rules_cache() -> None:
+    """Скидає кеш правил (викликати після зміни налаштувань адміном)."""
+    global _rules_cache, _rules_cache_ts
+    _rules_cache = None
+    _rules_cache_ts = 0.0
 
 
 async def ensure_defaults(db: Database) -> None:
