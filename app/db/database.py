@@ -79,6 +79,7 @@ class Database:
                     FOREIGN KEY(user_id) REFERENCES users(id)
                 );
                 CREATE INDEX IF NOT EXISTS idx_checks_check_code ON checks(check_code);
+                CREATE INDEX IF NOT EXISTS idx_checks_raw_text_hash ON checks(raw_text_hash);
 
                 CREATE TABLE IF NOT EXISTS promo_settings (
                     key TEXT PRIMARY KEY,
