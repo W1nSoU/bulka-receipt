@@ -72,11 +72,17 @@ async def main() -> None:
     print("─" * 60)
     print()
 
-    await dp.start_polling(
-        bot,
-        allowed_updates=dp.resolve_used_update_types(),
-        drop_pending_updates=True,
-    )
+    try:
+        await dp.start_polling(
+            bot,
+            allowed_updates=dp.resolve_used_update_types(),
+            drop_pending_updates=True,
+        )
+    finally:
+        from app.ai.groq_client import _rotator
+        if _rotator is not None:
+            await _rotator.close()
+        await bot.session.close()
 
 
 if __name__ == "__main__":

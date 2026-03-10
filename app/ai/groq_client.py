@@ -62,6 +62,13 @@ class CircularKeyRotator:
         self.clients = {key: AsyncGroq(api_key=key) for key in api_keys}
         
         logger.info(f"🔑 Initialized Groq with {len(api_keys)} API key(s)")
+
+    async def close(self) -> None:
+        for client in self.clients.values():
+            try:
+                await client.close()
+            except Exception:
+                pass
     
     def get_current_client(self) -> tuple[AsyncGroq, str]:
         """Отримує поточний клієнт і ключ"""

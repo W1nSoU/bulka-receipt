@@ -554,7 +554,7 @@ async def handle_receipt_photo(message: Message, state: FSMContext) -> None:
                     "Спробуйте надіслати краще фото. 📸"
                 )
         elif isinstance(exc, ReceiptParseError):
-            log.exception("Receipt parse error")
+            log.error("Receipt parse error", exc_info=exc)
             user_msg = (
                 "😔 <b>Не вдалося розпізнати чек.</b>\n\n"
                 "Переконайтесь, що:\n"
@@ -564,7 +564,7 @@ async def handle_receipt_photo(message: Message, state: FSMContext) -> None:
                 "Спробуйте надіслати краще фото. 📸"
             )
         else:
-            log.exception("Unexpected processing error")
+            log.error("Unexpected processing error: %s: %s", type(exc).__name__, exc, exc_info=exc)
             user_msg = "⚠️ <b>Сталася невідома помилка.</b>\nСпробуйте, будь ласка, ще раз."
         await _send_photo_message(message, user_msg, back_kb())
         return
