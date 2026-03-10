@@ -553,6 +553,12 @@ async def handle_receipt_photo(message: Message, state: FSMContext) -> None:
                 "Спробуйте надіслати краще фото. 📸"
             )
         else:
+            import traceback
+            print("=== UNEXPECTED ERROR ===")
+            traceback.print_exc()
+            print(f"Exception type: {type(exc).__name__}")
+            print(f"Exception: {exc}")
+            print("========================")
             log.exception("Unexpected processing error")
             user_msg = "⚠️ <b>Сталася невідома помилка.</b>\nСпробуйте, будь ласка, ще раз."
         await _send_photo_message(message, user_msg, back_kb())
