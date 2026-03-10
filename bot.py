@@ -13,11 +13,16 @@ from app import promo_manager
 from app import runtime
 
 
-logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%H:%M:%S",
+)
 # Silence noisy libraries; keep our own logs at INFO
 logging.getLogger("aiogram").setLevel(logging.WARNING)
 logging.getLogger("aiogram.event").setLevel(logging.WARNING)
 logging.getLogger("aiohttp").setLevel(logging.WARNING)
+logging.getLogger("app").setLevel(logging.DEBUG)
 log = logging.getLogger(__name__)
 
 
