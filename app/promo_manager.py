@@ -69,7 +69,7 @@ _rules_cache_ts: float = 0.0
 _RULES_CACHE_TTL = 30.0  # секунди
 
 
-async def rules_for_gemini(db: Database) -> Dict[str, Any]:
+async def rules_for_ai(db: Database) -> Dict[str, Any]:
     global _rules_cache, _rules_cache_ts
     now = time.monotonic()
     if _rules_cache is not None and (now - _rules_cache_ts) < _RULES_CACHE_TTL:

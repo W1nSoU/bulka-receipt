@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+from datetime import datetime
 from io import BytesIO
 
 from aiogram import Bot, F, Router
@@ -22,6 +23,16 @@ from app.states import ReceiptState, RegistrationState, ProfileState
 log = logging.getLogger(__name__)
 
 router = Router()
+
+
+def _fmt_date(date_str: str | None) -> str:
+    """Converts YYYY-MM-DD to DD.MM.YYYY for display."""
+    if not date_str:
+        return "—"
+    try:
+        return datetime.strptime(date_str, "%Y-%m-%d").strftime("%d.%m.%Y")
+    except ValueError:
+        return date_str
 
 
 async def _get_db_bot_settings(message: Message | CallbackQuery) -> tuple:
@@ -309,7 +320,7 @@ async def my_receipts(callback: CallbackQuery) -> None:
     ]
     for i, r in enumerate(receipts, 1):
         amount_str = f"{r.amount:.2f}" if r.amount else "—"
-        date_str = r.date if r.date else "—"
+        date_str = _fmt_date(r.date)
         shop_name = r.shop if r.shop else "Невідомо"
         check_code = r.check_code if r.check_code else f"#{r.id}"
 
@@ -506,7 +517,7 @@ async def handle_receipt_photo(message: Message, state: FSMContext) -> None:
     await message.bot.download(photo, destination=buffer)
     image_bytes = buffer.getvalue()
 
-    rules = await promo_manager.rules_for_gemini(db)
+    rules = await promo_manager.rules_for_ai(db)
     result = None
     exc = None
     try:
@@ -610,17 +621,15 @@ async def handle_receipt_photo(message: Message, state: FSMContext) -> None:
     )
 
     amount_str = f"{result.amount:.2f}" if result.amount else "—"
-    date_str = result.date or "—"
+    date_str = _fmt_date(result.date)
     shop_str = result.shop or "—"
 
     await _send_photo_message(
         message,
         "🔍 <b>Перевірте дані чека</b>\n\n"
-        "┌─────────────────────\n"
-        f"│ 🏪 <b>{shop_str}</b>\n"
-        f"│ 💰 <b>{amount_str} грн</b>\n"
-        f"│ 📅 {date_str}\n"
-        "└─────────────────────\n\n"
+        f"🏪 <b>{shop_str}</b>\n"
+        f"💰 {amount_str} грн\n"
+        f"📅 {date_str}\n\n"
         "Все правильно?",
         confirm_receipt_kb()
     )
@@ -657,17 +666,15 @@ async def confirm_receipt(callback: CallbackQuery, state: FSMContext) -> None:
 
     await state.clear()
     amount_str = f"{pending['amount']:.2f}" if pending.get("amount") else "—"
-    date_str = pending.get("date") or "—"
+    date_str = _fmt_date(pending.get("date"))
     shop_str = pending.get("shop") or "—"
 
     await _send_photo_message(
         callback.message,
         "🎉 <b>Чек успішно зареєстровано!</b>\n\n"
-        "┌─────────────────────\n"
-        f"│ 🏪 <b>{shop_str}</b>\n"
-        f"│ 💰 <b>{amount_str} грн</b>\n"
-        f"│ 📅 {date_str}\n"
-        "└─────────────────────\n\n"
+        f"🏪 <b>{shop_str}</b>\n"
+        f"💰 {amount_str} грн\n"
+        f"📅 {date_str}\n\n"
         f"🎟 Ваш номер у розіграші: <b>#{receipt.id}</b>\n\n"
         "Бажаємо удачі! 🍀",
         user_main_kb(is_admin=is_admin)

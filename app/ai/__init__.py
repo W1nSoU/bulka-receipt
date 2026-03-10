@@ -1,6 +1,6 @@
 """AI integration helpers."""
 
-from .groq_client import (  # Замість gemini_client
+from .groq_client import (
     analyze_receipt,
     ReceiptResult,
     ReceiptAnalysisError,
