@@ -57,3 +57,46 @@ def confirm_receipt_kb() -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text="❌ Скасувати", callback_data="back_to_main")],
         ]
     )
+
+
+def shop_selection_kb(active_shops: list[str]) -> InlineKeyboardMarkup:
+    """
+    Створює клавіатуру для вибору магазину зі списку активних магазинів.
+    
+    Args:
+        active_shops: Список назв активних магазинів
+    
+    Returns:
+        InlineKeyboardMarkup з кнопками для кожного магазину
+    """
+    buttons = []
+    
+    # Додаємо кнопку для кожного магазину
+    for shop in active_shops:
+        buttons.append([
+            InlineKeyboardButton(
+                text=f"✅ {shop}", 
+                callback_data=f"select_shop:{shop}"
+            )
+        ])
+    
+    # Кнопка "Скасувати"
+    buttons.append([
+        InlineKeyboardButton(text="❌ Скасувати", callback_data="back_to_main")
+    ])
+    
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def date_input_kb() -> InlineKeyboardMarkup:
+    """
+    Створює клавіатуру для запиту вводу дати.
+    
+    Returns:
+        InlineKeyboardMarkup з кнопкою скасування
+    """
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Скасувати", callback_data="back_to_main")]
+        ]
+    )

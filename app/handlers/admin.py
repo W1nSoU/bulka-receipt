@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import aiosqlite
 import logging
 import random
 from datetime import datetime
@@ -29,6 +30,8 @@ from app.keyboards import (
 )
 from app.states import (
     AdminAddShopState,
+    AdminContinueCampaignState,
+    AdminEditShopState,
     AdminSearchState,
     AdminSetChannelState,
     AdminSetDatesState,
@@ -304,6 +307,187 @@ async def admin_campaign_stop(callback: CallbackQuery, state: FSMContext) -> Non
             )
     else:
         await _send_admin_photo_message(callback.message, "Файл відсутній.", reply_markup=admin_main_kb(), edit=True, state=state)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin:campaign_continue")
+async def admin_campaign_continue(callback: CallbackQuery, state: FSMContext) -> None:
+    """Продовжити акцію - архівувати поточну та створити нову"""
+    db, _ = await _context()
+    
+    # Перевіряємо чи активна акція
+    is_active = await promo_manager.is_promo_active(db)
+    
+    # Підраховуємо чеки без campaign_id
+    uncategorized_count = await db._fetchone("SELECT COUNT(*) FROM checks WHERE campaign_id IS NULL")
+    checks_count = uncategorized_count[0] if uncategorized_count else 0
+    
+    # Отримуємо поточні налаштування
+    current_settings = await db.get_settings_map()
+    start_date = current_settings.get("start_date", "")
+    end_date = current_settings.get("end_date", "")
+    min_amount = current_settings.get("min_amount", 0)
+    active_shops = current_settings.get("active_shops", [])
+    
+    from app.states import AdminContinueCampaignState
+    await state.set_state(AdminContinueCampaignState.waiting_for_name)
+    await state.update_data(
+        old_start=start_date,
+        old_end=end_date,
+        old_min_amount=min_amount,
+        old_shops=active_shops,
+        checks_count=checks_count
+    )
+    
+    from app.keyboards import cancel_kb
+    await _send_admin_photo_message(
+        callback.message,
+        f"📦 <b>Продовження акції</b>\n\n"
+        f"{'🟢 Акція активна' if is_active else '🔴 Акція зупинена'}\n"
+        f"📊 Чеків без категорії: <b>{checks_count}</b>\n\n"
+        f"Поточні налаштування:\n"
+        f"📅 Період: {start_date} – {end_date}\n"
+        f"💰 Мін. сума: {min_amount} грн\n"
+        f"🏬 Магазини: {', '.join(active_shops) if active_shops else 'немає'}\n\n"
+        f"Введіть назву нової акції\n"
+        f"<i>(наприклад: \"Акція Лютий 2026\")</i>:",
+        reply_markup=cancel_kb("admin:main"),
+        edit=True,
+        state=state
+    )
+    await callback.answer()
+
+
+@router.message(AdminContinueCampaignState.waiting_for_name, F.text)
+async def admin_campaign_continue_name(message: Message, state: FSMContext) -> None:
+    from app.states import AdminContinueCampaignState
+    
+    campaign_name = message.text.strip()
+    data = await state.get_data()
+    
+    await state.update_data(campaign_name=campaign_name)
+    await state.set_state(AdminContinueCampaignState.waiting_for_confirmation)
+    
+    from app.keyboards import back_cancel_kb
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✅ Так, продовжити", callback_data="admin:campaign_continue:confirm")
+    kb.button(text="❌ Скасувати", callback_data="admin:main")
+    kb.adjust(1)
+    
+    await _send_admin_photo_message(
+        message,
+        f"📦 <b>Підтвердження продовження акції</b>\n\n"
+        f"Буде виконано:\n"
+        f"1️⃣ Поточні чеки ({data['checks_count']}) будуть прив'язані до поточної акції\n"
+        f"2️⃣ Поточна акція буде заархівована\n"
+        f"3️⃣ Створена нова акція: <b>{campaign_name}</b>\n"
+        f"4️⃣ Налаштування скопійовані з поточної:\n"
+        f"   📅 {data['old_start']} – {data['old_end']}\n"
+        f"   💰 {data['old_min_amount']} грн\n"
+        f"   🏬 {', '.join(data['old_shops']) if data['old_shops'] else 'немає'}\n\n"
+        f"<b>Після створення ви зможете змінити ці налаштування в меню</b>\n\n"
+        f"Продовжити?",
+        reply_markup=kb.as_markup(),
+        state=state
+    )
+
+
+@router.callback_query(F.data == "admin:campaign_continue:confirm")
+async def admin_campaign_continue_confirm(callback: CallbackQuery, state: FSMContext) -> None:
+    db, _ = await _context()
+    data = await state.get_data()
+    
+    try:
+        # 1. Створюємо нову кампанію з поточними налаштуваннями
+        campaign_id = await db.create_campaign(
+            name=data['campaign_name'],
+            start_date=data['old_start'],
+            end_date=data['old_end'],
+            min_amount=float(data['old_min_amount']),
+            shops=data['old_shops']
+        )
+        
+        # 2. Прив'язуємо всі чеки без campaign_id до попередньої акції
+        if data['checks_count'] > 0:
+            # Створюємо архівну акцію для старих чеків
+            old_campaign_id = await db.create_campaign(
+                name=f"Архівна акція до {data['campaign_name']}",
+                start_date=data['old_start'],
+                end_date=data['old_end'],
+                min_amount=float(data['old_min_amount']),
+                shops=data['old_shops']
+            )
+            await db.assign_checks_to_campaign(old_campaign_id)
+            await db.archive_current_campaign()  # Архівуємо стару
+            
+            # Робимо нову поточною
+            async with aiosqlite.connect(db.path) as conn:
+                await conn.execute("UPDATE campaigns SET is_current = 1 WHERE id = ?", (campaign_id,))
+                await conn.commit()
+        
+        # 3. Скидаємо кеш
+        promo_manager.invalidate_rules_cache()
+        
+        await _send_admin_photo_message(
+            callback.message,
+            f"✅ <b>Акцію продовжено!</b>\n\n"
+            f"📦 Створено нову акцію: <b>{data['campaign_name']}</b>\n"
+            f"📊 Старих чеків збережено: {data['checks_count']}\n\n"
+            f"Налаштування скопійовані. Ви можете змінити їх в меню ⚙️ Налаштування.",
+            reply_markup=admin_main_kb(),
+            edit=True,
+            state=state
+        )
+        await state.clear()
+        
+    except Exception as e:
+        log.error("Error continuing campaign: %s", e)
+        await _send_admin_photo_message(
+            callback.message,
+            f"❌ Помилка при продовженні акції: {str(e)}",
+            reply_markup=admin_main_kb(),
+            edit=True,
+            state=state
+        )
+        await state.clear()
+    
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin:campaign_history")
+async def admin_campaign_history(callback: CallbackQuery, state: FSMContext) -> None:
+    """Показує історію акцій"""
+    db, _ = await _context()
+    
+    campaigns = await db.get_campaigns_history()
+    
+    if not campaigns:
+        await _send_admin_photo_message(
+            callback.message,
+            "📜 <b>Історія акцій</b>\n\nАкцій ще немає.",
+            reply_markup=admin_main_kb(),
+            edit=True,
+            state=state
+        )
+    else:
+        lines = ["📜 <b>Історія акцій</b>\n"]
+        for campaign_id, name, start_date, end_date, checks_count, is_current in campaigns:
+            status = "🟢 ПОТОЧНА" if is_current else "📦 Архівна"
+            lines.append(
+                f"\n{status}\n"
+                f"<b>{name}</b>\n"
+                f"📅 {start_date} – {end_date}\n"
+                f"📊 Чеків: {checks_count}"
+            )
+        
+        await _send_admin_photo_message(
+            callback.message,
+            "\n".join(lines),
+            reply_markup=admin_main_kb(),
+            edit=True,
+            state=state
+        )
+    
     await callback.answer()
 
 
@@ -676,6 +860,104 @@ async def admin_shops_delete_item(callback: CallbackQuery, state: FSMContext) ->
     await shops_manager.delete_shop(db, shop_id)
     await _send_admin_photo_message(callback.message, "Магазин видалено", reply_markup=admin_shops_kb(), edit=True, state=state)
     await callback.answer("Готово")
+
+
+@router.callback_query(F.data == "admin:shops:edit")
+async def admin_shops_edit(callback: CallbackQuery, state: FSMContext) -> None:
+    db, _ = await _context()
+    shops = await db.list_shops()
+    if not shops:
+        await _send_admin_photo_message(callback.message, "Список магазинів порожній", reply_markup=admin_shops_kb(), edit=True, state=state)
+    else:
+        from app.keyboards import shops_edit_kb
+        await _send_admin_photo_message(
+            callback.message,
+            "Оберіть магазин для редагування:",
+            reply_markup=shops_edit_kb(shops),
+            edit=True,
+            state=state
+        )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin:shops:edit_item:"))
+async def admin_shops_edit_item(callback: CallbackQuery, state: FSMContext) -> None:
+    db, _ = await _context()
+    shop_id_str = callback.data.split(":")[-1]
+    try:
+        shop_id = int(shop_id_str)
+    except ValueError:
+        await callback.answer("Помилка id", show_alert=False)
+        return
+    
+    # Знаходимо магазин
+    shops = await db.list_shops()
+    shop_name = None
+    for sid, name in shops:
+        if sid == int(shop_id):
+            shop_name = name
+            break
+    
+    if not shop_name:
+        await callback.answer("Магазин не знайдено", show_alert=True)
+        return
+    
+    # Зберігаємо shop_id в стан і просимо ввести нову назву
+    from app.states import AdminEditShopState
+    await state.set_state(AdminEditShopState.waiting_for_new_name)
+    await state.update_data(edit_shop_id=shop_id, old_shop_name=shop_name)
+    
+    from app.keyboards import cancel_kb
+    await _send_admin_photo_message(
+        callback.message,
+        f"📝 Поточна назва: <b>{shop_name}</b>\n\n"
+        f"Введіть нову назву магазину:",
+        reply_markup=cancel_kb("admin:shops"),
+        edit=True,
+        state=state
+    )
+    await callback.answer()
+
+
+@router.message(AdminEditShopState.waiting_for_new_name, F.text)
+async def admin_shops_edit_name(message: Message, state: FSMContext) -> None:
+    from app.states import AdminEditShopState
+    db, _ = await _context()
+    
+    new_name = message.text.strip()
+    data = await state.get_data()
+    shop_id = data.get("edit_shop_id")
+    old_name = data.get("old_shop_name")
+    
+    if not shop_id or not old_name:
+        await _send_admin_photo_message(message, "❌ Сталася помилка", reply_markup=admin_shops_kb(), state=state)
+        await state.clear()
+        return
+    
+    # Перевіряємо чи не існує вже магазин з такою назвою
+    existing = [name.lower() for sid, name in await db.list_shops() if sid != shop_id]
+    if new_name.lower() in existing:
+        await _send_admin_photo_message(
+            message,
+            "❌ Магазин з такою назвою вже існує.\n"
+            "Введіть іншу назву:",
+            reply_markup=cancel_kb("admin:shops"),
+            state=state
+        )
+        return
+    
+    # Оновлюємо назву (це також оновить active_shops якщо магазин був активним)
+    await shops_manager.update_shop_name(db, shop_id, new_name)
+    
+    await _send_admin_photo_message(
+        message,
+        f"✅ Назву магазину змінено:\n"
+        f"<b>{old_name}</b> → <b>{new_name}</b>\n\n"
+        f"{'🎯 Оновлено в активній акції' if await promo_manager.is_promo_active(db) else ''}",
+        reply_markup=admin_shops_kb(),
+        state=state
+    )
+    await state.clear()
 
 
 @router.callback_query(F.data == "admin:shops:toggle")
@@ -1192,14 +1474,32 @@ async def add_shop_sample(message: Message, state: FSMContext) -> None:
 
 @router.message(AdminAddShopState.waiting_for_samples, F.text.regexp("(?i)^готово$"))
 async def add_shop_done(message: Message, state: FSMContext) -> None:
+    db, _ = await _context()
     data = await state.get_data()
     shop_name = data.get("shop_name", "Магазин")
-    await _send_admin_photo_message(
-        message,
-        f"✅ <b>{shop_name}</b> успішно додано!",
-        reply_markup=admin_shops_kb(),
-        state=state
-    )
+    
+    # Автоматично додаємо новий магазин до активних якщо акція запущена
+    is_active = await promo_manager.is_promo_active(db)
+    if is_active:
+        # Додаємо магазин до active_shops
+        await shops_manager.toggle_shop_for_campaign(db, shop_name)
+        promo_manager.invalidate_rules_cache()
+        
+        await _send_admin_photo_message(
+            message,
+            f"✅ <b>{shop_name}</b> успішно додано!\n\n"
+            f"🎯 Магазин автоматично додано до активної акції.",
+            reply_markup=admin_shops_kb(),
+            state=state
+        )
+    else:
+        await _send_admin_photo_message(
+            message,
+            f"✅ <b>{shop_name}</b> успішно додано!",
+            reply_markup=admin_shops_kb(),
+            state=state
+        )
+    
     await state.clear()
 
 

@@ -32,5 +32,22 @@ async def toggle_shop_for_campaign(db: Database, shop_name: str) -> bool:
     return await promo_manager.toggle_shop(db, shop_name)
 
 
+async def update_shop_name(db: Database, shop_id: int, new_name: str) -> str:
+    """Оновлює назву магазину та повертає стару назву.
+    Також оновлює active_shops якщо магазин був активним."""
+    old_name = await db.update_shop_name(shop_id, new_name)
+    
+    if old_name:
+        # Якщо магазин був активним - оновлюємо active_shops
+        current_active = await db.get_setting("active_shops", []) or []
+        if old_name in current_active:
+            # Замінюємо стару назву на нову
+            updated_active = [new_name if s == old_name else s for s in current_active]
+            await db.set_setting("active_shops", updated_active)
+            promo_manager.invalidate_rules_cache()
+    
+    return old_name
+
+
 async def add_sample(db: Database, shop_id: int, file_id: str) -> None:
     await db.add_shop_sample(shop_id, file_id)

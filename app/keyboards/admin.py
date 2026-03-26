@@ -8,12 +8,14 @@ def admin_main_kb() -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     kb.button(text="▶️ Запустити акцію", callback_data="admin:campaign_start")
     kb.button(text="⏹ Зупинити акцію", callback_data="admin:campaign_stop")
+    kb.button(text="📦 Продовжити акцію", callback_data="admin:campaign_continue")
     kb.button(text="⚙️ Налаштування", callback_data="admin:settings")
     kb.button(text="🏬 Магазини", callback_data="admin:shops")
     kb.button(text="📊 Статистика", callback_data="admin:stats")
     kb.button(text="🎯 Переможці", callback_data="admin:winner")
+    kb.button(text="📜 Історія акцій", callback_data="admin:campaign_history")
     kb.button(text="⬅️ На головну", callback_data="back_to_main")
-    kb.adjust(2, 2, 2, 1)
+    kb.adjust(2, 1, 2, 2, 2, 1)
     return kb.as_markup()
 
 
@@ -32,11 +34,12 @@ def admin_settings_kb() -> InlineKeyboardMarkup:
 def admin_shops_kb() -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     kb.button(text="➕ Додати", callback_data="admin:shops:add")
+    kb.button(text="✏️ Редагувати", callback_data="admin:shops:edit")
     kb.button(text="🗑 Видалити", callback_data="admin:shops:delete")
     kb.button(text="🔄 Увімкнути/Вимкнути", callback_data="admin:shops:toggle")
     kb.button(text="📋 Переглянути список", callback_data="admin:shops:list")
     kb.button(text="⬅️ Головне меню", callback_data="admin:main")
-    kb.adjust(2, 2, 1)
+    kb.adjust(2, 2, 2, 1)
     return kb.as_markup()
 
 
@@ -54,6 +57,15 @@ def shops_delete_kb(shops: list[tuple[int, str]]) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     for shop_id, name in shops:
         kb.button(text=f"🗑 {name}", callback_data=f"admin:shops:delete_item:{shop_id}")
+    kb.button(text="⬅️ Назад", callback_data="admin:shops")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+def shops_edit_kb(shops: list[tuple[int, str]]) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    for shop_id, name in shops:
+        kb.button(text=f"✏️ {name}", callback_data=f"admin:shops:edit_item:{shop_id}")
     kb.button(text="⬅️ Назад", callback_data="admin:shops")
     kb.adjust(1)
     return kb.as_markup()

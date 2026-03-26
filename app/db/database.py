@@ -64,9 +64,22 @@ class Database:
                     created_at TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS campaigns (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL,
+                    start_date TEXT NOT NULL,
+                    end_date TEXT NOT NULL,
+                    min_amount REAL DEFAULT 0.0,
+                    shops TEXT,
+                    is_current INTEGER DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    archived_at TEXT
+                );
+
                 CREATE TABLE IF NOT EXISTS checks (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     user_id INTEGER NOT NULL,
+                    campaign_id INTEGER,
                     shop TEXT,
                     amount REAL,
                     date TEXT,
@@ -80,6 +93,7 @@ class Database:
                 );
                 CREATE INDEX IF NOT EXISTS idx_checks_check_code ON checks(check_code);
                 CREATE INDEX IF NOT EXISTS idx_checks_raw_text_hash ON checks(raw_text_hash);
+                CREATE INDEX IF NOT EXISTS idx_checks_campaign_id ON checks(campaign_id);
 
                 CREATE TABLE IF NOT EXISTS promo_settings (
                     key TEXT PRIMARY KEY,
@@ -107,6 +121,13 @@ class Database:
                 await db.execute("ALTER TABLE checks ADD COLUMN raw_text_hash TEXT")
             except Exception:
                 pass  # колонка вже існує
+            
+            # Міграція: додаємо campaign_id якщо колонки ще немає
+            try:
+                await db.execute("ALTER TABLE checks ADD COLUMN campaign_id INTEGER")
+            except Exception:
+                pass  # колонка вже існує
+            
             # Індекс на raw_text_hash — після міграції, щоб колонка точно існувала
             try:
                 await db.execute(
@@ -312,6 +333,22 @@ class Database:
                 (address, shop_id),
             )
             await db.commit()
+
+    async def update_shop_name(self, shop_id: int, new_name: str) -> str:
+        """Оновлює назву магазину та повертає стару назву"""
+        # Спочатку отримуємо стару назву
+        row = await self._fetchone("SELECT name FROM shops WHERE id = ?", (shop_id,))
+        old_name = row[0] if row else None
+        
+        if old_name:
+            async with aiosqlite.connect(self.path) as db:
+                await db.execute(
+                    "UPDATE shops SET name = ? WHERE id = ?",
+                    (new_name, shop_id),
+                )
+                await db.commit()
+        
+        return old_name
 
     async def list_shops_with_addresses(self) -> List[tuple[int, str, Optional[str]]]:
         rows = await self._fetchall("SELECT id, name, address FROM shops ORDER BY name")
@@ -602,3 +639,74 @@ class Database:
             raw_text=row["raw_text"],
             created_at=row["created_at"],
         )
+
+    # Campaign management
+    async def create_campaign(
+        self, name: str, start_date: str, end_date: str, min_amount: float, shops: List[str]
+    ) -> int:
+        """Створює нову акцію"""
+        import json
+        now = datetime.utcnow().isoformat()
+        shops_json = json.dumps(shops)
+        
+        async with aiosqlite.connect(self.path) as db:
+            # Знімаємо прапорець is_current з усіх акцій
+            await db.execute("UPDATE campaigns SET is_current = 0")
+            
+            # Створюємо нову
+            cursor = await db.execute(
+                """INSERT INTO campaigns 
+                (name, start_date, end_date, min_amount, shops, is_current, created_at)
+                VALUES (?, ?, ?, ?, ?, 1, ?)""",
+                (name, start_date, end_date, min_amount, shops_json, now),
+            )
+            await db.commit()
+            return int(cursor.lastrowid)
+
+    async def get_current_campaign(self) -> Optional[tuple]:
+        """Повертає поточну акцію (id, name, start_date, end_date, min_amount, shops)"""
+        import json
+        row = await self._fetchone(
+            "SELECT id, name, start_date, end_date, min_amount, shops FROM campaigns WHERE is_current = 1 LIMIT 1"
+        )
+        if not row:
+            return None
+        shops = json.loads(row[5]) if row[5] else []
+        return (row[0], row[1], row[2], row[3], row[4], shops)
+
+    async def archive_current_campaign(self) -> None:
+        """Архівує поточну акцію"""
+        now = datetime.utcnow().isoformat()
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute(
+                "UPDATE campaigns SET is_current = 0, archived_at = ? WHERE is_current = 1",
+                (now,),
+            )
+            await db.commit()
+
+    async def assign_checks_to_campaign(self, campaign_id: int) -> int:
+        """Прив'язує всі чеки без campaign_id до вказаної акції. Повертає кількість оновлених."""
+        async with aiosqlite.connect(self.path) as db:
+            cursor = await db.execute(
+                "UPDATE checks SET campaign_id = ? WHERE campaign_id IS NULL",
+                (campaign_id,),
+            )
+            await db.commit()
+            return cursor.rowcount or 0
+
+    async def get_campaigns_history(self) -> List[tuple]:
+        """Повертає список всіх акцій (id, name, start_date, end_date, checks_count, is_current)"""
+        rows = await self._fetchall(
+            """
+            SELECT 
+                c.id, c.name, c.start_date, c.end_date,
+                COUNT(ch.id) as checks_count,
+                c.is_current
+            FROM campaigns c
+            LEFT JOIN checks ch ON ch.campaign_id = c.id
+            GROUP BY c.id
+            ORDER BY c.created_at DESC
+            """,
+            row_factory=aiosqlite.Row,
+        )
+        return [(row["id"], row["name"], row["start_date"], row["end_date"], row["checks_count"], row["is_current"]) for row in rows]

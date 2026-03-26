@@ -10,6 +10,8 @@ class RegistrationState(StatesGroup):
 
 class ReceiptState(StatesGroup):
     waiting_for_photo = State()
+    waiting_for_shop_selection = State()
+    waiting_for_date_input = State()
     waiting_for_confirm = State()
 
 
@@ -21,6 +23,10 @@ class AdminAddShopState(StatesGroup):
     waiting_for_name = State()
     waiting_for_address = State()
     waiting_for_samples = State()
+
+
+class AdminEditShopState(StatesGroup):
+    waiting_for_new_name = State()
 
 
 class AdminSetDatesState(StatesGroup):
@@ -61,3 +67,8 @@ class AdminWinnerState(StatesGroup):
 
 class AdminSetChannelState(StatesGroup):
     waiting_for_channel = State()
+
+
+class AdminContinueCampaignState(StatesGroup):
+    waiting_for_name = State()
+    waiting_for_confirmation = State()

@@ -574,6 +574,144 @@ async def handle_receipt_photo(message: Message, state: FSMContext) -> None:
         result.shop, result.amount, result.date, result.check_code, result.errors,
     )
 
+    # Перевірка чи магазин співпадає з активними магазинами акції
+    active_shops = rules.get("allowed_shops", [])
+    shop_matches = False
+    
+    if result.shop and active_shops:
+        shop_upper = result.shop.upper()
+        # Перевірка точного співпадіння або fuzzy match
+        for allowed_shop in active_shops:
+            if shop_upper == allowed_shop.upper():
+                shop_matches = True
+                break
+            # Fuzzy matching (допускаємо 1 символ різниці)
+            if len(shop_upper) > 2 and len(allowed_shop) > 2:
+                # Проста перевірка на близькість
+                diff_count = sum(1 for a, b in zip(shop_upper, allowed_shop.upper()) if a != b)
+                if diff_count <= 1 and abs(len(shop_upper) - len(allowed_shop)) <= 1:
+                    shop_matches = True
+                    break
+    
+    # Якщо магазин не співпадає але чек валідний в інших аспектах - пропонуємо вибір
+    if not shop_matches and active_shops and not result.is_valid:
+        # Перевіряємо чи єдина помилка - це магазин
+        shop_related_errors = [err for err in result.errors if "магазин" in err.lower() or "участь" in err.lower()]
+        other_errors = [err for err in result.errors if err not in shop_related_errors]
+        
+        if shop_related_errors and not other_errors:
+            # Тільки проблема з магазином - пропонуємо вибір
+            log.info("Shop mismatch, offering selection. Detected: %s, Active: %s", result.shop, active_shops)
+            
+            # Хеш для дубль-перевірки
+            raw_hash = hashlib.sha256(
+                result.raw_text.lower().replace(" ", "").encode()
+            ).hexdigest() if result.raw_text else None
+            
+            # Перевірка дублікатів перед вибором магазину
+            if (result.check_code and await db.is_duplicate_check_code(result.check_code)) or \
+               (raw_hash and await db.is_duplicate_raw_hash(raw_hash)):
+                log.warning("Duplicate receipt detected: code=%s hash=%s", result.check_code, raw_hash)
+                await _send_photo_message(
+                    message,
+                    "🔁 <b>Цей чек вже зареєстровано.</b>\n\n"
+                    "Кожен чек можна надіслати лише один раз.\n"
+                    "Надішліть інший чек, щоб продовжити.",
+                    back_kb()
+                )
+                return
+            
+            # Зберігаємо дані чека і переходимо до вибору магазину
+            await state.set_state(ReceiptState.waiting_for_shop_selection)
+            await state.update_data(
+                pending_receipt={
+                    "shop": result.shop,  # Розпізнаний магазин (для інформації)
+                    "amount": result.amount,
+                    "date": result.date,
+                    "time": result.time,
+                    "check_code": result.check_code,
+                    "address": result.address,
+                    "raw_text": result.raw_text,
+                    "raw_hash": raw_hash,
+                    "file_id": photo.file_id,
+                }
+            )
+            
+            detected_shop_info = f"\n\n<i>Розпізнано: {result.shop}</i>" if result.shop else ""
+            
+            from app.keyboards import shop_selection_kb
+            await _send_photo_message(
+                message,
+                f"🏪 <b>Оберіть магазин з чека</b>\n\n"
+                f"AI розпізнав назву магазину, але вона не співпадає з учасниками акції.{detected_shop_info}\n\n"
+                f"Будь ласка, оберіть правильний магазин зі списку:",
+                shop_selection_kb(active_shops)
+            )
+            return
+    
+    # Перевірка чи проблема тільки з датою
+    if not result.is_valid:
+        date_related_errors = [err for err in result.errors if "дата" in err.lower() or "межами акції" in err.lower() or "період" in err.lower()]
+        other_errors = [err for err in result.errors if err not in date_related_errors]
+        
+        if date_related_errors and not other_errors:
+            # Тільки проблема з датою - пропонуємо ввести вручну
+            log.info("Date mismatch, requesting manual input. Detected: %s", result.date)
+            
+            # Хеш для дубль-перевірки
+            raw_hash = hashlib.sha256(
+                result.raw_text.lower().replace(" ", "").encode()
+            ).hexdigest() if result.raw_text else None
+            
+            # Перевірка дублікатів перед вводом дати
+            if (result.check_code and await db.is_duplicate_check_code(result.check_code)) or \
+               (raw_hash and await db.is_duplicate_raw_hash(raw_hash)):
+                log.warning("Duplicate receipt detected: code=%s hash=%s", result.check_code, raw_hash)
+                await _send_photo_message(
+                    message,
+                    "🔁 <b>Цей чек вже зареєстровано.</b>\n\n"
+                    "Кожен чек можна надіслати лише один раз.\n"
+                    "Надішліть інший чек, щоб продовжити.",
+                    back_kb()
+                )
+                return
+            
+            # Зберігаємо дані чека і переходимо до вводу дати
+            await state.set_state(ReceiptState.waiting_for_date_input)
+            await state.update_data(
+                pending_receipt={
+                    "shop": result.shop,
+                    "amount": result.amount,
+                    "date": result.date,  # Розпізнана дата (для інформації)
+                    "time": result.time,
+                    "check_code": result.check_code,
+                    "address": result.address,
+                    "raw_text": result.raw_text,
+                    "raw_hash": raw_hash,
+                    "file_id": photo.file_id,
+                }
+            )
+            
+            detected_date_info = f"\n\n<i>Розпізнано: {_fmt_date(result.date)}</i>" if result.date else ""
+            
+            # Отримуємо період акції
+            start_date = rules.get("start_date")
+            end_date = rules.get("end_date")
+            period_info = ""
+            if start_date and end_date:
+                period_info = f"\n📅 Період акції: <b>{_fmt_date(start_date)} - {_fmt_date(end_date)}</b>"
+            
+            from app.keyboards import date_input_kb
+            await _send_photo_message(
+                message,
+                f"📅 <b>Введіть дату з чека</b>\n\n"
+                f"AI розпізнав дату, але вона не входить в період акції.{detected_date_info}{period_info}\n\n"
+                f"Будь ласка, введіть правильну дату у форматі <b>ДД.ММ.РРРР</b>\n"
+                f"Наприклад: <code>15.01.2025</code>",
+                date_input_kb()
+            )
+            return
+    
     if not result.is_valid:
         reason = result.errors[0] if result.errors else "Чек не пройшов перевірку"
         log.warning("Receipt invalid: %s", reason)
@@ -692,6 +830,179 @@ async def retry_receipt_photo(callback: CallbackQuery, state: FSMContext) -> Non
         back_kb()
     )
     await callback.answer()
+
+
+@router.callback_query(ReceiptState.waiting_for_shop_selection, F.data.startswith("select_shop:"))
+async def handle_shop_selection(callback: CallbackQuery, state: FSMContext) -> None:
+    """Обробка вибору магазину користувачем"""
+    db, settings = await _get_db_bot_settings(callback.message)
+    user = await db.fetch_user(callback.from_user.id)
+    
+    # Витягуємо назву обраного магазину з callback_data
+    selected_shop = callback.data.split(":", 1)[1]
+    
+    data = await state.get_data()
+    pending = data.get("pending_receipt")
+    
+    if not pending or not user:
+        await state.clear()
+        await callback.answer("Сесія застаріла, спробуйте ще раз.", show_alert=True)
+        return
+    
+    # Оновлюємо магазин на обраний користувачем
+    pending["shop"] = selected_shop
+    
+    log.info(
+        "User %s manually selected shop: %s (was: %s)",
+        user.telegram_id, selected_shop, pending.get("shop")
+    )
+    
+    # Перевірка чи дата в межах акції
+    from datetime import datetime
+    rules = await promo_manager.rules_for_ai(db)
+    start_date_str = rules.get("start_date")
+    end_date_str = rules.get("end_date")
+    date_valid = True
+    
+    if pending.get("date") and start_date_str and end_date_str:
+        try:
+            receipt_date = datetime.strptime(pending["date"], "%Y-%m-%d").date()
+            start_date = datetime.strptime(start_date_str, "%Y-%m-%d").date()
+            end_date = datetime.strptime(end_date_str, "%Y-%m-%d").date()
+            
+            if not (start_date <= receipt_date <= end_date):
+                date_valid = False
+        except ValueError:
+            date_valid = False
+    
+    # Якщо дата невалідна - запитуємо її вручну
+    if not date_valid:
+        log.info("Date still invalid after shop selection, requesting manual input")
+        await state.set_state(ReceiptState.waiting_for_date_input)
+        await state.update_data(pending_receipt=pending)
+        
+        detected_date_info = f"\n\n<i>Розпізнано: {_fmt_date(pending.get('date'))}</i>" if pending.get('date') else ""
+        period_info = ""
+        if start_date_str and end_date_str:
+            period_info = f"\n📅 Період акції: <b>{_fmt_date(start_date_str)} - {_fmt_date(end_date_str)}</b>"
+        
+        from app.keyboards import date_input_kb
+        await _send_photo_message(
+            callback.message,
+            f"📅 <b>Введіть дату з чека</b>\n\n"
+            f"Магазин обрано, але дата не входить в період акції.{detected_date_info}{period_info}\n\n"
+            f"Будь ласка, введіть правильну дату у форматі <b>ДД.ММ.РРРР</b>\n"
+            f"Наприклад: <code>15.01.2025</code>",
+            date_input_kb()
+        )
+        await callback.answer("✅ Магазин обрано, введіть дату")
+        return
+    
+    # Переходимо до підтвердження
+    await state.set_state(ReceiptState.waiting_for_confirm)
+    await state.update_data(pending_receipt=pending)
+    
+    amount_str = f"{pending['amount']:.2f}" if pending.get('amount') else "—"
+    date_str = _fmt_date(pending.get('date'))
+    
+    await _send_photo_message(
+        callback.message,
+        "🔍 <b>Перевірте дані чека</b>\n\n"
+        f"🏪 <b>{selected_shop}</b>\n"
+        f"💰 {amount_str} грн\n"
+        f"📅 {date_str}\n\n"
+        "Все правильно?",
+        confirm_receipt_kb()
+    )
+    await callback.answer(f"✅ Обрано: {selected_shop}")
+
+
+@router.message(ReceiptState.waiting_for_date_input, F.text)
+async def handle_date_input(message: Message, state: FSMContext) -> None:
+    """Обробка введення дати користувачем"""
+    from datetime import datetime
+    
+    db, settings = await _get_db_bot_settings(message)
+    user = await db.fetch_user(message.from_user.id)
+    
+    data = await state.get_data()
+    pending = data.get("pending_receipt")
+    
+    if not pending or not user:
+        await state.clear()
+        await _send_photo_message(message, "Сесія застаріла, спробуйте ще раз.", back_kb())
+        return
+    
+    date_text = message.text.strip()
+    
+    # Спроба парсити дату у форматі ДД.ММ.РРРР
+    parsed_date = None
+    try:
+        parsed_date = datetime.strptime(date_text, "%d.%m.%Y")
+    except ValueError:
+        # Спроба альтернативних форматів
+        for fmt in ["%d/%m/%Y", "%d-%m-%Y", "%Y-%m-%d"]:
+            try:
+                parsed_date = datetime.strptime(date_text, fmt)
+                break
+            except ValueError:
+                continue
+    
+    if not parsed_date:
+        await _send_photo_message(
+            message,
+            "❌ <b>Неправильний формат дати</b>\n\n"
+            "Будь ласка, введіть дату у форматі <b>ДД.ММ.РРРР</b>\n"
+            "Наприклад: <code>15.01.2025</code>",
+            back_kb()
+        )
+        return
+    
+    # Перевірка чи дата в межах акції
+    rules = await promo_manager.rules_for_ai(db)
+    start_date_str = rules.get("start_date")
+    end_date_str = rules.get("end_date")
+    
+    if start_date_str and end_date_str:
+        start_date = datetime.strptime(start_date_str, "%Y-%m-%d").date()
+        end_date = datetime.strptime(end_date_str, "%Y-%m-%d").date()
+        
+        if not (start_date <= parsed_date.date() <= end_date):
+            await _send_photo_message(
+                message,
+                f"❌ <b>Дата поза межами акції</b>\n\n"
+                f"📅 Період акції: <b>{_fmt_date(start_date_str)} - {_fmt_date(end_date_str)}</b>\n\n"
+                f"Введена дата: <b>{parsed_date.strftime('%d.%m.%Y')}</b>\n\n"
+                f"Будь ласка, введіть дату яка входить в період акції:",
+                back_kb()
+            )
+            return
+    
+    # Оновлюємо дату на введену користувачем
+    pending["date"] = parsed_date.strftime("%Y-%m-%d")
+    
+    log.info(
+        "User %s manually entered date: %s (was: %s)",
+        user.telegram_id, pending["date"], data.get("pending_receipt", {}).get("date")
+    )
+    
+    # Переходимо до підтвердження
+    await state.set_state(ReceiptState.waiting_for_confirm)
+    await state.update_data(pending_receipt=pending)
+    
+    amount_str = f"{pending['amount']:.2f}" if pending.get('amount') else "—"
+    date_str = _fmt_date(pending.get('date'))
+    shop_str = pending.get('shop') or "—"
+    
+    await _send_photo_message(
+        message,
+        "🔍 <b>Перевірте дані чека</b>\n\n"
+        f"🏪 <b>{shop_str}</b>\n"
+        f"💰 {amount_str} грн\n"
+        f"📅 {date_str}\n\n"
+        "Все правильно?",
+        confirm_receipt_kb()
+    )
 
 
 @router.message(ReceiptState.waiting_for_photo)
