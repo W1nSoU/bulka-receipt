@@ -594,8 +594,8 @@ async def handle_receipt_photo(message: Message, state: FSMContext) -> None:
     
     # Якщо магазин не співпадає але чек валідний в інших аспектах - пропонуємо вибір
     if not shop_matches and active_shops and not result.is_valid:
-        # Перевіряємо чи єдина помилка - це магазин
-        shop_related_errors = [err for err in result.errors if "магазин" in err.lower() or "участь" in err.lower()]
+        # Перевіряємо чи єдина помилка - це магазин або адреса
+        shop_related_errors = [err for err in result.errors if any(word in err.lower() for word in ["магазин", "участь", "адреса"])]
         other_errors = [err for err in result.errors if err not in shop_related_errors]
         
         if shop_related_errors and not other_errors:
@@ -650,7 +650,7 @@ async def handle_receipt_photo(message: Message, state: FSMContext) -> None:
     
     # Перевірка чи проблема тільки з датою або часом
     if not result.is_valid:
-        date_related_errors = [err for err in result.errors if any(word in err.lower() for word in ["дата", "час", "період", "меж", "діапазон"])]
+        date_related_errors = [err for err in result.errors if any(word in err.lower() for word in ["дата", "час", "період", "меж", "діапазон", "формат", "не вдалося"])]
         other_errors = [err for err in result.errors if err not in date_related_errors]
         
         if date_related_errors and not other_errors:

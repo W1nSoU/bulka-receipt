@@ -766,12 +766,27 @@ def _validate_against_rules(result: ReceiptResult, rules: Dict[str, Any]) -> Rec
             errors.append("Не вдалося визначити дату покупки.")
         else:
             try:
-                receipt_date = datetime.strptime(result.date, "%Y-%m-%d").date()
+                # Спробуємо різні формати дати, які може повернути AI або regex
+                receipt_date = None
+                for fmt in ["%Y-%m-%d", "%d.%m.%Y", "%d/%m/%Y", "%d-%m-%Y"]:
+                    try:
+                        receipt_date = datetime.strptime(result.date, fmt).date()
+                        break
+                    except ValueError:
+                        continue
+                
+                if not receipt_date:
+                    raise ValueError(f"Unknown date format: {result.date}")
+
                 start_dt = datetime.strptime(start_date, "%Y-%m-%d").date()
                 end_dt = datetime.strptime(end_date, "%Y-%m-%d").date()
                 
                 if receipt_date < start_dt or receipt_date > end_dt:
                     errors.append("Дата покупки не входить у період акції.")
+                
+                # Нормалізуємо дату до YYYY-MM-DD для бази даних
+                result.date = receipt_date.strftime("%Y-%m-%d")
+                
             except ValueError as e:
                 logger.warning(f"Date validation error: {e}")
                 errors.append("Невірний формат дати на чеку.")
