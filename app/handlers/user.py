@@ -266,11 +266,10 @@ async def start_receipt_flow(callback: CallbackQuery, state: FSMContext) -> None
         "📸 <b>РЕЄСТРАЦІЯ ЧЕКА</b>\n\n"
         "Для участі в розіграші надішліть чітке фото фіскального чека.\n\n"
         "👇 <b>Натисніть на значок скріпки 📎 та оберіть фото</b>\n\n"
-        "<i>Переконайтесь, що на фото чітко видно:</i>\n"
-        "• Назву магазину\n"
-        "• Дату та час\n"
-        "• Суму покупки\n"
-        "• Фіскальний номер",
+        "<i>Переконайтесь, що:</i>\n"
+        "• <b>На фото лише чек, без сторонніх предметів</b>\n"
+        "• <b>Чек займає весь екран та знаходиться у фокусі</b>\n"
+        "• Чітко видно назву магазину, дату, суму та фіскальний номер",
         back_kb()
     )
     await callback.answer()
@@ -649,14 +648,14 @@ async def handle_receipt_photo(message: Message, state: FSMContext) -> None:
             )
             return
     
-    # Перевірка чи проблема тільки з датою
+    # Перевірка чи проблема тільки з датою або часом
     if not result.is_valid:
-        date_related_errors = [err for err in result.errors if "дата" in err.lower() or "межами акції" in err.lower() or "період" in err.lower()]
+        date_related_errors = [err for err in result.errors if any(word in err.lower() for word in ["дата", "час", "період", "меж", "діапазон"])]
         other_errors = [err for err in result.errors if err not in date_related_errors]
         
         if date_related_errors and not other_errors:
-            # Тільки проблема з датою - пропонуємо ввести вручну
-            log.info("Date mismatch, requesting manual input. Detected: %s", result.date)
+            # Тільки проблема з датою/часом - пропонуємо ввести вручну
+            log.info("Date/Time mismatch, requesting manual input. Detected: date=%s, time=%s", result.date, result.time)
             
             # Хеш для дубль-перевірки
             raw_hash = hashlib.sha256(
