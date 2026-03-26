@@ -642,7 +642,7 @@ async def handle_receipt_photo(message: Message, state: FSMContext) -> None:
             await _send_photo_message(
                 message,
                 f"🏪 <b>Оберіть магазин з чека</b>\n\n"
-                f"AI розпізнав назву магазину, але вона не співпадає з учасниками акції.{detected_shop_info}\n\n"
+                f"ШІ розпізнав назву магазину, але вона не співпадає з учасниками акції.{detected_shop_info}\n\n"
                 f"Будь ласка, оберіть правильний магазин зі списку:",
                 shop_selection_kb(active_shops)
             )
@@ -704,7 +704,7 @@ async def handle_receipt_photo(message: Message, state: FSMContext) -> None:
             await _send_photo_message(
                 message,
                 f"📅 <b>Введіть дату з чека</b>\n\n"
-                f"AI розпізнав дату, але вона не входить в період акції.{detected_date_info}{period_info}\n\n"
+                f"ШІ розпізнав дату, але вона не входить в період акції.{detected_date_info}{period_info}\n\n"
                 f"Будь ласка, введіть правильну дату у форматі <b>ДД.ММ.РРРР</b>\n"
                 f"Наприклад: <code>15.01.2025</code>",
                 date_input_kb()
