@@ -79,7 +79,6 @@ class Database:
                 CREATE TABLE IF NOT EXISTS checks (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     user_id INTEGER NOT NULL,
-                    campaign_id INTEGER,
                     shop TEXT,
                     amount REAL,
                     date TEXT,
@@ -87,13 +86,10 @@ class Database:
                     check_code TEXT,
                     file_id TEXT NOT NULL,
                     raw_text TEXT,
-                    raw_text_hash TEXT,
                     created_at TEXT NOT NULL,
                     FOREIGN KEY(user_id) REFERENCES users(id)
                 );
                 CREATE INDEX IF NOT EXISTS idx_checks_check_code ON checks(check_code);
-                CREATE INDEX IF NOT EXISTS idx_checks_raw_text_hash ON checks(raw_text_hash);
-                CREATE INDEX IF NOT EXISTS idx_checks_campaign_id ON checks(campaign_id);
 
                 CREATE TABLE IF NOT EXISTS promo_settings (
                     key TEXT PRIMARY KEY,
@@ -135,6 +131,15 @@ class Database:
                 )
             except Exception:
                 pass
+            
+            # Індекс на campaign_id — після міграції
+            try:
+                await db.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_checks_campaign_id ON checks(campaign_id)"
+                )
+            except Exception:
+                pass
+            
             await db.commit()
 
     async def fetch_user(self, telegram_id: int) -> Optional[User]:
