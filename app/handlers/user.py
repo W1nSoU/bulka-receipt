@@ -706,7 +706,7 @@ async def handle_receipt_photo(message: Message, state: FSMContext) -> None:
                 f"📅 <b>Введіть дату з чека</b>\n\n"
                 f"ШІ розпізнав дату, але вона не входить в період акції.{detected_date_info}{period_info}\n\n"
                 f"Будь ласка, введіть правильну дату у форматі <b>ДД.ММ.РРРР</b>\n"
-                f"Наприклад: <code>15.01.2025</code>",
+                f"Наприклад: <code>15.01.2026</code>",
                 date_input_kb()
             )
             return
@@ -891,7 +891,7 @@ async def handle_shop_selection(callback: CallbackQuery, state: FSMContext) -> N
             f"📅 <b>Введіть дату з чека</b>\n\n"
             f"Магазин обрано, але дата не входить в період акції.{detected_date_info}{period_info}\n\n"
             f"Будь ласка, введіть правильну дату у форматі <b>ДД.ММ.РРРР</b>\n"
-            f"Наприклад: <code>15.01.2025</code>",
+            f"Наприклад: <code>15.01.2026</code>",
             date_input_kb()
         )
         await callback.answer("✅ Магазин обрано, введіть дату")
@@ -952,7 +952,7 @@ async def handle_date_input(message: Message, state: FSMContext) -> None:
             message,
             "❌ <b>Неправильний формат дати</b>\n\n"
             "Будь ласка, введіть дату у форматі <b>ДД.ММ.РРРР</b>\n"
-            "Наприклад: <code>15.01.2025</code>",
+            "Наприклад: <code>15.01.2026</code>",
             back_kb()
         )
         return
