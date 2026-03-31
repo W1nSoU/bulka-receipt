@@ -246,12 +246,21 @@ class Database:
             created_at=now,
         )
 
-    async def is_duplicate_check_code(self, check_code: Optional[str]) -> bool:
+    async def is_duplicate_check_code(self, check_code: Optional[str], amount: Optional[float] = None) -> bool:
         if not check_code:
             return False
-        row = await self._fetchone(
-            "SELECT id FROM checks WHERE check_code = ? LIMIT 1", (check_code,)
-        )
+        
+        if amount is not None:
+            # Якщо є сума, перевіряємо комбінацію код + сума
+            row = await self._fetchone(
+                "SELECT id FROM checks WHERE check_code = ? AND amount = ? LIMIT 1", 
+                (check_code, amount)
+            )
+        else:
+            # Fallback на стару логіку
+            row = await self._fetchone(
+                "SELECT id FROM checks WHERE check_code = ? LIMIT 1", (check_code,)
+            )
         return row is not None
 
     async def is_duplicate_raw_hash(self, raw_text_hash: Optional[str]) -> bool:

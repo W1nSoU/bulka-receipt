@@ -608,7 +608,7 @@ async def handle_receipt_photo(message: Message, state: FSMContext) -> None:
             ).hexdigest() if result.raw_text else None
             
             # Перевірка дублікатів перед вибором магазину
-            if (result.check_code and await db.is_duplicate_check_code(result.check_code)) or \
+            if (result.check_code and await db.is_duplicate_check_code(result.check_code, result.amount)) or \
                (raw_hash and await db.is_duplicate_raw_hash(raw_hash)):
                 log.warning("Duplicate receipt detected: code=%s hash=%s", result.check_code, raw_hash)
                 await _send_photo_message(
@@ -663,7 +663,7 @@ async def handle_receipt_photo(message: Message, state: FSMContext) -> None:
             ).hexdigest() if result.raw_text else None
             
             # Перевірка дублікатів перед вводом дати
-            if (result.check_code and await db.is_duplicate_check_code(result.check_code)) or \
+            if (result.check_code and await db.is_duplicate_check_code(result.check_code, result.amount)) or \
                (raw_hash and await db.is_duplicate_raw_hash(raw_hash)):
                 log.warning("Duplicate receipt detected: code=%s hash=%s", result.check_code, raw_hash)
                 await _send_photo_message(
@@ -729,7 +729,7 @@ async def handle_receipt_photo(message: Message, state: FSMContext) -> None:
     ).hexdigest() if result.raw_text else None
 
     # Дублікат по коду або по тексту
-    if (result.check_code and await db.is_duplicate_check_code(result.check_code)) or \
+    if (result.check_code and await db.is_duplicate_check_code(result.check_code, result.amount)) or \
        (raw_hash and await db.is_duplicate_raw_hash(raw_hash)):
         log.warning("Duplicate receipt detected: code=%s hash=%s", result.check_code, raw_hash)
         await _send_photo_message(
