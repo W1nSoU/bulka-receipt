@@ -33,6 +33,8 @@ class Receipt:
 
 
 class Database:
+    EXCLUDED_SHOP_FOR_STATS = 'ТОВ "Епіцентр К" Гіпермаркет "Епіцентр К"'
+
     def __init__(self, path: Path):
         self.path = path
 
@@ -408,9 +410,11 @@ class Database:
             """
             SELECT COALESCE(shop, 'Невідомо') as shop, COUNT(*) as cnt, SUM(amount) as total
             FROM checks
+            WHERE UPPER(TRIM(COALESCE(shop, ''))) != UPPER(TRIM(?))
             GROUP BY shop
             ORDER BY cnt DESC
-            """
+            """,
+            (self.EXCLUDED_SHOP_FOR_STATS,),
         )
         result: List[tuple[str, int, float]] = []
         for row in rows:

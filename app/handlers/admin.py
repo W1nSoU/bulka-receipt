@@ -794,8 +794,16 @@ async def admin_stats_by_shop(callback: CallbackQuery, state: FSMContext) -> Non
         text = "Немає зареєстрованих чеків."
     else:
         lines = ["Статистика за магазинами:"]
+        total_checks = 0
+        total_amount = 0.0
         for shop, cnt, total_sum in rows:
             lines.append(f"• {shop} — {cnt} чеків, сума {total_sum:.2f} грн")
+            total_checks += cnt
+            total_amount += total_sum
+        lines.append("")
+        lines.append(f"Всього магазинів: {len(rows)}")
+        lines.append(f"Всього чеків (без виключеного магазину): {total_checks}")
+        lines.append(f"Загальна сума (без виключеного магазину): {total_amount:.2f} грн")
         text = "\n".join(lines)
     await _send_admin_photo_message(callback.message, text, reply_markup=admin_stats_kb(), edit=True, state=state)
     await callback.answer()
