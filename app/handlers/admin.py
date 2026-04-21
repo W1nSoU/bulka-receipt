@@ -63,10 +63,53 @@ class AdminCallbackFilter(BaseFilter):
 
 
 router = Router()
+TELEGRAM_CAPTION_MAX_LEN = 1024
+TELEGRAM_MESSAGE_MAX_LEN = 4096
 
 
 async def _context() -> tuple[Database, Settings]:
     return runtime.get_db(), runtime.get_settings()
+
+
+def _split_message_chunks(text: str, max_len: int) -> list[str]:
+    if len(text) <= max_len:
+        return [text]
+
+    chunks: list[str] = []
+    current = ""
+    for line in text.splitlines(keepends=True):
+        if len(line) > max_len:
+            if current:
+                chunks.append(current.rstrip("\n"))
+                current = ""
+            for i in range(0, len(line), max_len):
+                chunks.append(line[i : i + max_len].rstrip("\n"))
+            continue
+        if current and len(current) + len(line) > max_len:
+            chunks.append(current.rstrip("\n"))
+            current = line
+            continue
+        current += line
+
+    if current:
+        chunks.append(current.rstrip("\n"))
+
+    return chunks or [text[:max_len]]
+
+
+async def _send_admin_text_message(
+    message: Message,
+    text: str,
+    reply_markup=None,
+    state: FSMContext = None,
+):
+    chunks = _split_message_chunks(text, TELEGRAM_MESSAGE_MAX_LEN)
+    sent = await message.answer(chunks[0], reply_markup=reply_markup)
+    for chunk in chunks[1:]:
+        await message.answer(chunk)
+    if state:
+        await state.update_data(bot_msg_id=sent.message_id)
+    return sent
 
 
 async def _send_admin_photo_message(message: Message, text: str, reply_markup=None, state: FSMContext = None, edit: bool = False):
@@ -97,12 +140,20 @@ async def _send_admin_photo_message(message: Message, text: str, reply_markup=No
                 pass
         
         # Send NEW message
+        if len(text) > TELEGRAM_CAPTION_MAX_LEN:
+            return await _send_admin_text_message(message, text, reply_markup=reply_markup, state=state)
         sent = await message.answer_photo(photo, caption=text, reply_markup=reply_markup)
         await state.update_data(bot_msg_id=sent.message_id)
         return sent
 
     # 2. Handle Callback (Button click) -> Edit existing
     if edit:
+        if len(text) > TELEGRAM_CAPTION_MAX_LEN:
+            try:
+                await message.delete()
+            except Exception:
+                pass
+            return await _send_admin_text_message(message, text, reply_markup=reply_markup, state=state)
         try:
             await message.edit_caption(caption=text, reply_markup=reply_markup)
             # Ensure bot_msg_id is up to date in state
@@ -122,6 +173,8 @@ async def _send_admin_photo_message(message: Message, text: str, reply_markup=No
         except Exception:
             pass
     
+    if len(text) > TELEGRAM_CAPTION_MAX_LEN:
+        return await _send_admin_text_message(message, text, reply_markup=reply_markup, state=state)
     sent = await message.answer_photo(photo, caption=text, reply_markup=reply_markup)
     if state:
         await state.update_data(bot_msg_id=sent.message_id)
