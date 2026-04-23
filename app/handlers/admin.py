@@ -25,6 +25,8 @@ from app.keyboards import (
     admin_winner_kb,
     shops_delete_kb,
     shops_toggle_kb,
+    stats_shop_exclude_kb,
+    stats_shop_exclude_confirm_kb,
     cancel_kb,
     back_cancel_kb,
 )
@@ -65,6 +67,7 @@ class AdminCallbackFilter(BaseFilter):
 router = Router()
 TELEGRAM_CAPTION_MAX_LEN = 1024
 TELEGRAM_MESSAGE_MAX_LEN = 4096
+SHOPS_EXCLUDE_PAGE_SIZE = 10
 
 
 async def _context() -> tuple[Database, Settings]:
@@ -572,11 +575,11 @@ async def admin_winner(callback: CallbackQuery, state: FSMContext) -> None:
 @router.callback_query(F.data == "admin:winner:by_receipt")
 async def admin_winner_by_receipt(callback: CallbackQuery, state: FSMContext) -> None:
     db, _ = await _context()
-    total_checks = await db.count_checks()
-    if total_checks == 0:
+    total_participants = await db.count_unique_participants()
+    if total_participants == 0:
         await _send_admin_photo_message(
             callback.message,
-            "❌ <b>Немає жодного зареєстрованого чека</b>\n\n" "Дочекайтесь, поки учасники зареєструють чеки.",
+            "❌ <b>Немає жодного учасника з чеком</b>\n\nДочекайтесь, поки учасники зареєструють чеки.",
             reply_markup=admin_winner_kb(),
             edit=True,
             state=state
@@ -586,7 +589,11 @@ async def admin_winner_by_receipt(callback: CallbackQuery, state: FSMContext) ->
     await state.set_state(AdminWinnerState.waiting_for_count)
     await _send_admin_photo_message(
         callback.message,
-        f"🎟 <b>Вибір переможців</b>\n\n" f"Всього зареєстровано чеків: <b>{total_checks}</b>\n\n" f"Введіть кількість переможців (від 1 до {min(total_checks, 100)}):",
+        (
+            "🎟 <b>Вибір переможців</b>\n\n"
+            f"Унікальних учасників з чеками: <b>{total_participants}</b>\n\n"
+            f"Введіть кількість переможців (від 1 до {total_participants}):"
+        ),
         edit=True,
         state=state
     )
@@ -624,26 +631,26 @@ async def admin_winner_count(message: Message, state: FSMContext) -> None:
         await _send_admin_photo_message(message, "❌ Введіть число.", state=state)
         return
     
-    total_checks = await db.count_checks()
-    if count < 1 or count > min(total_checks, 100):
-        await _send_admin_photo_message(message, f"❌ Введіть число від 1 до {min(total_checks, 100)}.", state=state)
+    total_participants = await db.count_unique_participants()
+    if count < 1 or count > total_participants:
+        await _send_admin_photo_message(message, f"❌ Введіть число від 1 до {total_participants}.", state=state)
         return
     
-    # Вибираємо випадкових переможців
-    winners = await db.random_receipts(count)
-    if not winners:
+    # Вибираємо випадкових переможців без повторення людей
+    winner_pairs = await db.random_winners_by_unique_users(count)
+    if len(winner_pairs) != count:
         await state.clear()
         await _send_admin_photo_message(message, "❌ Не вдалося обрати переможців.", reply_markup=admin_winner_kb(), state=state)
         return
     
-    # Зберігаємо переможців у state
     winners_data = []
-    for receipt in winners:
-        user = await db.find_user(receipt.user_id)
+    for place, (receipt, user) in enumerate(winner_pairs, 1):
         winners_data.append({
+            "place": place,
             "receipt_id": receipt.id,
             "full_name": user.full_name if user else "Невідомо",
             "phone": user.phone if user else "",
+            "telegram_id": user.telegram_id if user else None,
             "check_code": receipt.check_code or str(receipt.id),
             "amount": receipt.amount or 0,
         })
@@ -652,8 +659,8 @@ async def admin_winner_count(message: Message, state: FSMContext) -> None:
     
     # Формуємо список переможців
     lines = ["🏆 <b>ПЕРЕМОЖЦІ РОЗІГРАШУ</b>\n"]
-    for i, w in enumerate(winners_data, 1):
-        lines.append(f"{i}. {w['full_name']}")
+    for w in winners_data:
+        lines.append(f"{w['place']}. {w['full_name']}")
         lines.append(f"   📞 {w['phone']}")
         lines.append(f"   🎫 Чек: #{w['check_code']}")
         lines.append(f"   💰 {w['amount']:.2f} грн\n")
@@ -675,8 +682,8 @@ async def admin_winner_finish_no(callback: CallbackQuery, state: FSMContext) -> 
     
     # Показуємо список з кнопками перевибору
     lines = ["🏆 <b>ПЕРЕМОЖЦІ РОЗІГРАШУ</b>\n"]
-    for i, w in enumerate(winners, 1):
-        lines.append(f"{i}. {w['full_name']}, {w['phone']}, #{w['check_code']}, {w['amount']:.2f} грн")
+    for w in winners:
+        lines.append(f"{w['place']}. {w['full_name']}, {w['phone']}, #{w['check_code']}, {w['amount']:.2f} грн")
     
     await state.clear()
     await _send_admin_photo_message(
@@ -694,13 +701,43 @@ async def admin_winner_finish_yes(callback: CallbackQuery, state: FSMContext) ->
     db, settings = await _context()
     data = await state.get_data()
     winners = data.get("winners", [])
+
+    if not winners:
+        await state.clear()
+        await _send_admin_photo_message(
+            callback.message,
+            "❌ Немає сформованого списку переможців. Оберіть переможців ще раз.",
+            reply_markup=admin_winner_kb(),
+            edit=True,
+            state=state,
+        )
+        await callback.answer()
+        return
     
     # Формуємо повідомлення про переможців
     lines = ["🏆 <b>ПЕРЕМОЖЦІ РОЗІГРАШУ</b>\n"]
-    for i, w in enumerate(winners, 1):
-        lines.append(f"{i}. {w['full_name']}, {w['phone']}, #{w['check_code']}, {w['amount']:.2f} грн")
+    for w in winners:
+        lines.append(f"{w['place']}. {w['full_name']}, {w['phone']}, #{w['check_code']}, {w['amount']:.2f} грн")
     
     winners_text = "\n".join(lines)
+
+    notified = 0
+    for w in winners:
+        telegram_id = w.get("telegram_id")
+        if telegram_id is None:
+            continue
+        try:
+            await callback.message.bot.send_message(
+                int(telegram_id),
+                (
+                    "🎉 Вітаємо!\n\n"
+                    f"Ви посіли <b>{w['place']}</b> місце у розіграші.\n"
+                    f"Ваш чек: <b>#{w['check_code']}</b>."
+                ),
+            )
+            notified += 1
+        except (TelegramForbiddenError, TelegramBadRequest):
+            log.warning("Failed to notify winner telegram_id=%s place=%s", telegram_id, w.get("place"))
     
     # Спочатку відправляємо файл звіту
     await promo_manager.set_promo_active(db, False)
@@ -719,7 +756,12 @@ async def admin_winner_finish_yes(callback: CallbackQuery, state: FSMContext) ->
     
     await _send_admin_photo_message(
         callback.message,
-        f"✅ <b>Акцію завершено!</b>\n\n" f"{winners_text}\n\n" f"📄 Файл звіту надіслано адміністраторам.",
+        (
+            "✅ <b>Акцію завершено!</b>\n\n"
+            f"{winners_text}\n\n"
+            f"👤 Повідомлено переможців: {notified}/{len(winners)}\n"
+            "📄 Файл звіту надіслано адміністраторам."
+        ),
         reply_markup=_winner_done_kb(),
         edit=True,
         state=state
@@ -837,6 +879,160 @@ async def admin_stats_overview(callback: CallbackQuery, state: FSMContext) -> No
     )
     await _send_admin_photo_message(callback.message, text, reply_markup=admin_stats_kb(), edit=True, state=state)
     await callback.answer()
+
+
+def _parse_exclude_callback_payload(data: str, expected_prefix: str) -> tuple[int, int] | None:
+    parts = data.split(":")
+    if len(parts) != 6 or ":".join(parts[:4]) != expected_prefix:
+        return None
+    try:
+        return int(parts[4]), int(parts[5])
+    except ValueError:
+        return None
+
+
+async def _show_stats_exclude_shop_page(
+    message: Message,
+    state: FSMContext,
+    page: int = 0,
+    edit: bool = True,
+    notice: str | None = None,
+) -> None:
+    db, _ = await _context()
+    rows = await db.stats_by_shop()
+    if not rows:
+        await _send_admin_photo_message(
+            message,
+            "Немає магазинів для виключення з участі.",
+            reply_markup=admin_stats_kb(),
+            edit=edit,
+            state=state,
+        )
+        await state.update_data(stats_exclude_rows=[])
+        return
+
+    serialized_rows = [
+        {"shop": shop, "cnt": cnt, "total": total_sum}
+        for shop, cnt, total_sum in rows
+    ]
+    await state.update_data(stats_exclude_rows=serialized_rows)
+
+    total_pages = (len(serialized_rows) + SHOPS_EXCLUDE_PAGE_SIZE - 1) // SHOPS_EXCLUDE_PAGE_SIZE
+    page = max(0, min(page, total_pages - 1))
+    start = page * SHOPS_EXCLUDE_PAGE_SIZE
+    page_items = []
+    for idx, item in enumerate(serialized_rows[start : start + SHOPS_EXCLUDE_PAGE_SIZE], start=start):
+        page_items.append((idx, str(item["shop"]), int(item["cnt"]), float(item["total"])))
+
+    header = "Оберіть магазин, чеки якого потрібно видалити з участі:"
+    if notice:
+        header = f"{notice}\n\n{header}"
+    text = (
+        f"{header}\n\n"
+        f"Сторінка {page + 1}/{total_pages}\n"
+        "Показано до 10 магазинів на сторінку."
+    )
+    await _send_admin_photo_message(
+        message,
+        text,
+        reply_markup=stats_shop_exclude_kb(page_items, page, total_pages),
+        edit=edit,
+        state=state,
+    )
+
+
+@router.callback_query(F.data == "admin:stats:exclude")
+async def admin_stats_exclude(callback: CallbackQuery, state: FSMContext) -> None:
+    await _show_stats_exclude_shop_page(callback.message, state, page=0, edit=True)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin:stats:exclude:page:"))
+async def admin_stats_exclude_page(callback: CallbackQuery, state: FSMContext) -> None:
+    parts = callback.data.split(":")
+    if len(parts) != 5:
+        await callback.answer("Некоректна сторінка", show_alert=False)
+        return
+    try:
+        page = int(parts[4])
+    except ValueError:
+        await callback.answer("Некоректна сторінка", show_alert=False)
+        return
+    await _show_stats_exclude_shop_page(callback.message, state, page=page, edit=True)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin:stats:exclude:pick:"))
+async def admin_stats_exclude_pick(callback: CallbackQuery, state: FSMContext) -> None:
+    payload = _parse_exclude_callback_payload(callback.data, "admin:stats:exclude:pick")
+    if payload is None:
+        await callback.answer("Некоректні дані", show_alert=False)
+        return
+    shop_idx, page = payload
+    data = await state.get_data()
+    rows = data.get("stats_exclude_rows") or []
+    if not (0 <= shop_idx < len(rows)):
+        await _show_stats_exclude_shop_page(callback.message, state, page=0, edit=True)
+        await callback.answer("Список оновлено, оберіть магазин ще раз", show_alert=False)
+        return
+
+    row = rows[shop_idx]
+    shop_name = str(row["shop"])
+    checks_count = int(row["cnt"])
+    total_sum = float(row["total"])
+    text = (
+        f"Ви дійсно хочете видалити з участі всі чеки магазину:\n"
+        f"«{shop_name}»?\n\n"
+        f"Буде видалено чеків: {checks_count}\n"
+        f"Сума цих чеків: {total_sum:.2f} грн"
+    )
+    await _send_admin_photo_message(
+        callback.message,
+        text,
+        reply_markup=stats_shop_exclude_confirm_kb(shop_idx, page),
+        edit=True,
+        state=state,
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin:stats:exclude:confirm:"))
+async def admin_stats_exclude_confirm(callback: CallbackQuery, state: FSMContext) -> None:
+    payload = _parse_exclude_callback_payload(callback.data, "admin:stats:exclude:confirm")
+    if payload is None:
+        await callback.answer("Некоректні дані", show_alert=False)
+        return
+    shop_idx, page = payload
+
+    data = await state.get_data()
+    rows = data.get("stats_exclude_rows") or []
+    if not (0 <= shop_idx < len(rows)):
+        await _show_stats_exclude_shop_page(callback.message, state, page=0, edit=True)
+        await callback.answer("Список оновлено, оберіть магазин ще раз", show_alert=False)
+        return
+
+    shop_name = str(rows[shop_idx]["shop"])
+    db, _ = await _context()
+    deleted_count, recipients = await db.delete_checks_by_shop(shop_name)
+
+    notify_text = (
+        f'Ваші чеки з магазину "{shop_name}" відкликані, '
+        "оскільки вони не підлягають умовам акції."
+    )
+    notified = 0
+    for telegram_id in recipients:
+        try:
+            await callback.message.bot.send_message(telegram_id, notify_text)
+            notified += 1
+        except (TelegramForbiddenError, TelegramBadRequest):
+            log.warning("Failed to notify user telegram_id=%s for excluded shop=%s", telegram_id, shop_name)
+
+    notice = (
+        f"✅ З магазину «{shop_name}» видалено {deleted_count} чек(ів).\n"
+        f"Повідомлено користувачів: {notified}/{len(recipients)}."
+    )
+    await _show_stats_exclude_shop_page(callback.message, state, page=page, edit=True, notice=notice)
+    await callback.answer("Готово")
 
 
 @router.callback_query(F.data == "admin:stats:by_shop")

@@ -405,6 +405,10 @@ class Database:
         # currently every saved check is valid by workflow
         return await self.count_checks()
 
+    async def count_unique_participants(self) -> int:
+        row = await self._fetchone("SELECT COUNT(DISTINCT user_id) FROM checks")
+        return int(row[0]) if row else 0
+
     async def stats_by_shop(self) -> List[tuple[str, int, float]]:
         rows = await self._fetchall(
             """
@@ -421,6 +425,42 @@ class Database:
             total = float(row[2]) if row[2] is not None else 0.0
             result.append((str(row[0]), int(row[1]), total))
         return result
+
+    async def delete_checks_by_shop(self, shop_name: str) -> tuple[int, List[int]]:
+        normalized_shop = shop_name.strip()
+        async with aiosqlite.connect(self.path) as db:
+            recipients_cursor = await db.execute(
+                """
+                SELECT DISTINCT u.telegram_id
+                FROM checks c
+                JOIN users u ON u.id = c.user_id
+                WHERE UPPER(TRIM(COALESCE(c.shop, ''))) = UPPER(TRIM(?))
+                """,
+                (normalized_shop,),
+            )
+            recipient_rows = await recipients_cursor.fetchall()
+            recipients = [int(row[0]) for row in recipient_rows if row[0] is not None]
+
+            count_cursor = await db.execute(
+                """
+                SELECT COUNT(*)
+                FROM checks
+                WHERE UPPER(TRIM(COALESCE(shop, ''))) = UPPER(TRIM(?))
+                """,
+                (normalized_shop,),
+            )
+            count_row = await count_cursor.fetchone()
+            deleted_count = int(count_row[0]) if count_row else 0
+
+            await db.execute(
+                """
+                DELETE FROM checks
+                WHERE UPPER(TRIM(COALESCE(shop, ''))) = UPPER(TRIM(?))
+                """,
+                (normalized_shop,),
+            )
+            await db.commit()
+            return deleted_count, recipients
 
     async def stats_overview(self) -> tuple[int, int, float]:
         row = await self._fetchone(
@@ -494,6 +534,49 @@ class Database:
             )
             for row in rows
         ]
+
+    async def random_winners_by_unique_users(
+        self, count: int
+    ) -> List[tuple[Receipt, User]]:
+        user_rows = await self._fetchall(
+            """
+            SELECT DISTINCT user_id
+            FROM checks
+            ORDER BY RANDOM()
+            LIMIT ?
+            """,
+            (count,),
+        )
+        winner_pairs: List[tuple[Receipt, User]] = []
+        for user_row in user_rows:
+            user_id = int(user_row[0])
+            receipt_row = await self._fetchone(
+                """
+                SELECT * FROM checks
+                WHERE user_id = ?
+                ORDER BY RANDOM()
+                LIMIT 1
+                """,
+                (user_id,),
+                row_factory=aiosqlite.Row,
+            )
+            user = await self.find_user(user_id)
+            if not receipt_row or not user:
+                continue
+            receipt = Receipt(
+                id=receipt_row["id"],
+                user_id=receipt_row["user_id"],
+                shop=receipt_row["shop"],
+                amount=receipt_row["amount"],
+                date=receipt_row["date"],
+                time=receipt_row["time"],
+                check_code=receipt_row["check_code"],
+                file_id=receipt_row["file_id"],
+                raw_text=receipt_row["raw_text"],
+                created_at=receipt_row["created_at"],
+            )
+            winner_pairs.append((receipt, user))
+        return winner_pairs
 
     async def random_user_with_stats(self) -> Optional[tuple[User, int, float]]:
         row = await self._fetchone(

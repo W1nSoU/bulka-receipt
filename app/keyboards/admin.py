@@ -75,10 +75,40 @@ def admin_stats_kb() -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     kb.button(text="📈 Загальна", callback_data="admin:stats:overview")
     kb.button(text="🏬 За магазинами", callback_data="admin:stats:by_shop")
+    kb.button(text="🚫 Видалити з участі", callback_data="admin:stats:exclude")
     kb.button(text="📆 За період", callback_data="admin:stats:by_period")
     kb.button(text="🧾 Останні чеки", callback_data="admin:stats:last_checks")
     kb.button(text="⬅️ Головне меню", callback_data="admin:main")
-    kb.adjust(2, 2, 1)
+    kb.adjust(2, 1, 2, 1)
+    return kb.as_markup()
+
+
+def stats_shop_exclude_kb(
+    shops: list[tuple[int, str, int, float]],
+    page: int,
+    total_pages: int,
+) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    for idx, shop, cnt, _ in shops:
+        label = f"🗑 {shop} ({cnt})"
+        kb.button(text=label, callback_data=f"admin:stats:exclude:pick:{idx}:{page}")
+
+    if total_pages > 1:
+        if page > 0:
+            kb.button(text="⬅️ Попередня", callback_data=f"admin:stats:exclude:page:{page - 1}")
+        if page < total_pages - 1:
+            kb.button(text="➡️ Наступна", callback_data=f"admin:stats:exclude:page:{page + 1}")
+
+    kb.button(text="⬅️ Назад до статистики", callback_data="admin:stats:by_shop")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+def stats_shop_exclude_confirm_kb(shop_idx: int, page: int) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✅ Так, видалити", callback_data=f"admin:stats:exclude:confirm:{shop_idx}:{page}")
+    kb.button(text="❌ Ні, скасувати", callback_data=f"admin:stats:exclude:page:{page}")
+    kb.adjust(1)
     return kb.as_markup()
 
 

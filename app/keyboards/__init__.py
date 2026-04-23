@@ -7,6 +7,8 @@ from .admin import (
     shops_toggle_kb,
     shops_delete_kb,
     shops_edit_kb,
+    stats_shop_exclude_kb,
+    stats_shop_exclude_confirm_kb,
     cancel_kb,
     back_cancel_kb,
 )
@@ -21,6 +23,8 @@ __all__ = [
     "shops_toggle_kb",
     "shops_delete_kb",
     "shops_edit_kb",
+    "stats_shop_exclude_kb",
+    "stats_shop_exclude_confirm_kb",
     "cancel_kb",
     "back_cancel_kb",
     "user_main_kb",
